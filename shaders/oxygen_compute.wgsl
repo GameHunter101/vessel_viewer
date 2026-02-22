@@ -22,4 +22,5 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         res += dist;
     }
     textureStore(oxygen_concentration, id.xy, vec4f(res, 0.0, 1.0));
+    // textureStore(oxygen_concentration, id.xy, vec4f(1.0));
 }

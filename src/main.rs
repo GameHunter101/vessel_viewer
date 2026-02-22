@@ -1,8 +1,10 @@
 use image::EncodableLayout;
+use nalgebra::Vector3;
 use v4::{
     V4,
     builtin_components::mesh_component::{MeshComponent, VertexData, VertexDescriptor},
     ecs::{
+        component::ComponentSystem,
         compute::Compute,
         material::{ShaderAttachment, ShaderBufferAttachment, ShaderTextureAttachment},
     },
@@ -10,6 +12,10 @@ use v4::{
     scene,
 };
 use wgpu::vertex_attr_array;
+
+use crate::network_generation_component::NetworkGenerationComponent;
+
+mod network_generation_component;
 
 #[tokio::main]
 async fn main() {
@@ -58,7 +64,7 @@ async fn main() {
         })
         .collect();
 
-    let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0_f32, 0.0, 0.0, 1.0]));
+    let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0, 0.0, 0.0, 1.0]));
     let bytes = img.as_bytes();
 
     let (oxygen_concentration_texture, oxygen_concentration_texture_bundle) =
@@ -71,6 +77,7 @@ async fn main() {
                 format: wgpu::TextureFormat::Rgba32Float,
                 storage_texture: Some(wgpu::StorageTextureAccess::ReadWrite),
                 is_sampled: false,
+                extra_usages: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
                 ..Default::default()
             },
         );
@@ -84,83 +91,122 @@ async fn main() {
         },
     );
 
+    let mut compute = Compute::builder()
+        .attachments(vec![
+            ShaderAttachment::Buffer(ShaderBufferAttachment::new(
+                device,
+                bytemuck::cast_slice(&oxygen_compute_edges),
+                wgpu::BufferBindingType::Uniform,
+                wgpu::ShaderStages::COMPUTE,
+                wgpu::BufferUsages::empty(),
+            )),
+            ShaderAttachment::Texture(ShaderTextureAttachment {
+                texture_bundle: oxygen_concentration_texture_bundle.clone(),
+                visibility: wgpu::ShaderStages::COMPUTE,
+            }),
+        ])
+        .shader_path("shaders/oxygen_compute.wgsl")
+        .workgroup_counts((512, 512, 1))
+        .build();
+
+    compute.initialize(device);
+
+    rendering_manager.individual_compute_execution(&[compute]);
+
+    let boundary: Vec<Vector3<f32>> = vessels
+        .iter()
+        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 1.0)) * 256.0)
+        .collect();
+
+    let size = oxygen_concentration_texture_bundle 
+        .properties()
+        .format
+        .theoretical_memory_footprint(oxygen_concentration_texture.size());
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Oxygen texture retrievel bundle"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     scene! {
-            scene: vessel_viewer,
-            "oxygen_concentration" = {
-                material: {
-                    pipeline: {
-                        vertex_shader_path: "shaders/oxygen_display_vertex.wgsl",
-                        fragment_shader_path: "shaders/oxygen_display_fragment.wgsl",
-                        uses_camera: false,
-                        vertex_layouts: [DisplayVertex::vertex_layout()],
-                    },
-                    attachments: [
-                        Texture(
-                            texture_bundle: oxygen_concentration_display_texture_bundle,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                        )
-                    ]
+        scene: vessel_viewer,
+        "oxygen_concentration" = {
+            material: {
+                pipeline: {
+                    vertex_shader_path: "shaders/oxygen_display_vertex.wgsl",
+                    fragment_shader_path: "shaders/oxygen_display_fragment.wgsl",
+                    uses_camera: false,
+                    vertex_layouts: [DisplayVertex::vertex_layout()],
                 },
-                components: [
-                    MeshComponent(
-                        vertices: vec![vec![
-                            DisplayVertex {
-                                pos: [-1.0, 3.0, 0.1],
-                                tex_coords: [0.0, 2.0]
-                            },
-                            DisplayVertex {
-                                pos: [-1.0, -1.0, 0.1],
-                                tex_coords: [0.0, 0.0]
-                            },
-                            DisplayVertex {
-                                pos: [3.0, -1.0, 0.1],
-                                tex_coords: [2.0, 0.0]
-                            },
-                        ]],
-                            enabled_models: vec![(0, None)]
+                attachments: [
+                    Texture(
+                        texture_bundle: oxygen_concentration_display_texture_bundle,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                     )
                 ]
             },
-            "vessels" = {
-                material: {
-                    pipeline: {
-                        vertex_shader_path: "shaders/vessel_vertex.wgsl",
-                        fragment_shader_path: "shaders/vessel_fragment.wgsl",
-                        uses_camera: false,
-                        vertex_layouts: [Vertex::vertex_layout()],
-                        geometry_details: {
-                            topology: wgpu::PrimitiveTopology::LineList,
-                            polygon_mode: wgpu::PolygonMode::Line,
-                        }
+            components: [
+                MeshComponent(
+                    vertices: vec![vec![
+                        DisplayVertex {
+                            pos: [-1.0, 3.0, 0.1],
+                            tex_coords: [0.0, 2.0]
+                        },
+                        DisplayVertex {
+                            pos: [-1.0, -1.0, 0.1],
+                            tex_coords: [0.0, 0.0]
+                        },
+                        DisplayVertex {
+                            pos: [3.0, -1.0, 0.1],
+                            tex_coords: [2.0, 0.0]
+                        },
+                    ]],
+                    enabled_models: vec![(0, None)]
+                ),
+                NetworkGenerationComponent(concentration_texture_bundle: oxygen_concentration_texture_bundle, boundary: boundary, buf: buf)
+            ]
+        },
+        "vessels" = {
+            material: {
+                pipeline: {
+                    vertex_shader_path: "shaders/vessel_vertex.wgsl",
+                    fragment_shader_path: "shaders/vessel_fragment.wgsl",
+                    uses_camera: false,
+                    vertex_layouts: [Vertex::vertex_layout()],
+                    geometry_details: {
+                        topology: wgpu::PrimitiveTopology::LineList,
+                        polygon_mode: wgpu::PolygonMode::Line,
                     }
-                },
-                components: [
-                    MeshComponent(
-                        vertices: vec![vessels],
-                        enabled_models: vec![(0, None)]
-                    )
-                ],
-                computes: [
-                    Compute(
-                        attachments: vec![
-                            ShaderAttachment::Buffer(ShaderBufferAttachment::new(
-                                device,
-                                bytemuck::cast_slice(&oxygen_compute_edges),
-                                wgpu::BufferBindingType::Uniform,
-                                wgpu::ShaderStages::COMPUTE,
-                                wgpu::BufferUsages::empty(),
-                            )),
-                            ShaderAttachment::Texture(ShaderTextureAttachment {
-                                texture_bundle: oxygen_concentration_texture_bundle,
-                                visibility: wgpu::ShaderStages::COMPUTE
-                            })
-                        ],
-                        shader_path: "shaders/oxygen_compute.wgsl",
-                        workgroup_counts: (512, 512, 1)
-                    )
-                ]
-            }
+                }
+            },
+            components: [
+                MeshComponent(
+                    vertices: vec![vessels],
+                    enabled_models: vec![(0, None)]
+                )
+            ],
+            /* computes: [
+                Compute(
+                    attachments: vec![
+                        ShaderAttachment::Buffer(ShaderBufferAttachment::new(
+                            device,
+                            bytemuck::cast_slice(&oxygen_compute_edges),
+                            wgpu::BufferBindingType::Uniform,
+                            wgpu::ShaderStages::COMPUTE,
+                            wgpu::BufferUsages::empty(),
+                        )),
+                        ShaderAttachment::Texture(ShaderTextureAttachment {
+                            texture_bundle: oxygen_concentration_texture_bundle,
+                            visibility: wgpu::ShaderStages::COMPUTE
+                        })
+                    ],
+                    shader_path: "shaders/oxygen_compute.wgsl",
+                    workgroup_counts: (512, 512, 1)
+                )
+            ] */
         }
+    }
 
     engine.attach_scene(vessel_viewer);
 

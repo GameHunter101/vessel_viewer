@@ -1,6 +1,6 @@
 [package]
 name = "vessel_viewer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -12,3 +12,4 @@ bytemuck = "1.25.0"
 algoe = { git = "https://github.com/GameHunter101/Algoe" }
 winit = { version = "0.29.15" }
 image = "0.25.9"
+pollster = "0.4.0"
