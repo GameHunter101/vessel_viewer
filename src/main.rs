@@ -115,7 +115,7 @@ async fn main() {
 
     let boundary: Vec<Vector3<f32>> = vessels
         .iter()
-        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 1.0)) * 256.0)
+        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * 256.0)
         .collect();
 
     let size = oxygen_concentration_texture_bundle 
@@ -164,7 +164,12 @@ async fn main() {
                     ]],
                     enabled_models: vec![(0, None)]
                 ),
-                NetworkGenerationComponent(concentration_texture_bundle: oxygen_concentration_texture_bundle, boundary: boundary, buf: buf)
+                NetworkGenerationComponent(
+                    concentration_texture_bundle: oxygen_concentration_texture_bundle,
+                    boundary: boundary,
+                    buf: buf,
+                    max_iter_count: 1,
+                )
             ]
         },
         "vessels" = {
