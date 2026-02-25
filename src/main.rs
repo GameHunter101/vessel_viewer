@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use image::EncodableLayout;
 use nalgebra::Vector3;
 use v4::{
@@ -41,11 +43,11 @@ async fn main() {
             color: [1.0, 0.0, 0.0, 1.0],
         },
         Vertex {
-            pos: [-1.0, 0.85, 0.0],
+            pos: [1.0, 0.85, 0.0],
             color: [0.0, 0.0, 1.0, 1.0],
         },
         Vertex {
-            pos: [1.0, 0.85, 0.0],
+            pos: [-1.0, 0.85, 0.0],
             color: [0.0, 0.0, 1.0, 1.0],
         },
     ];
@@ -118,16 +120,17 @@ async fn main() {
         .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * 256.0)
         .collect();
 
-    let size = oxygen_concentration_texture_bundle 
-        .properties()
-        .format
-        .theoretical_memory_footprint(oxygen_concentration_texture.size());
-    let buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Oxygen texture retrievel bundle"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let boundary_adjacency_list: HashMap<usize, HashSet<usize>> = (0..boundary.len())
+        .map(|i| {
+            (
+                i,
+                HashSet::from_iter([
+                    (i as i32 - 1).rem_euclid(boundary.len() as i32) as usize,
+                    (i + 1) % boundary.len(),
+                ]),
+            )
+        })
+        .collect();
 
     scene! {
         scene: vessel_viewer,
@@ -165,10 +168,11 @@ async fn main() {
                     enabled_models: vec![(0, None)]
                 ),
                 NetworkGenerationComponent(
-                    concentration_texture_bundle: oxygen_concentration_texture_bundle,
-                    boundary: boundary,
-                    buf: buf,
-                    max_iter_count: 1,
+                    boundary_verts: boundary,
+                    boundary_adjacency_list: boundary_adjacency_list,
+                    max_iter_count: 3,
+                    non_edges: HashSet::from([[0, 3], [1, 2]]),
+                    vessel_edges_component: ident("vessel_edges"),
                 )
             ]
         },
@@ -188,28 +192,10 @@ async fn main() {
             components: [
                 MeshComponent(
                     vertices: vec![vessels],
-                    enabled_models: vec![(0, None)]
+                    enabled_models: vec![(0, None)],
+                    ident: "vessel_edges",
                 )
             ],
-            /* computes: [
-                Compute(
-                    attachments: vec![
-                        ShaderAttachment::Buffer(ShaderBufferAttachment::new(
-                            device,
-                            bytemuck::cast_slice(&oxygen_compute_edges),
-                            wgpu::BufferBindingType::Uniform,
-                            wgpu::ShaderStages::COMPUTE,
-                            wgpu::BufferUsages::empty(),
-                        )),
-                        ShaderAttachment::Texture(ShaderTextureAttachment {
-                            texture_bundle: oxygen_concentration_texture_bundle,
-                            visibility: wgpu::ShaderStages::COMPUTE
-                        })
-                    ],
-                    shader_path: "shaders/oxygen_compute.wgsl",
-                    workgroup_counts: (512, 512, 1)
-                )
-            ] */
         }
     }
 
@@ -220,7 +206,7 @@ async fn main() {
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-struct Vertex {
+pub struct Vertex {
     pos: [f32; 3],
     color: [f32; 4],
 }

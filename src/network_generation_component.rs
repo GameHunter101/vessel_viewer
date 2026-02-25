@@ -1,156 +1,263 @@
-use image::Rgba32FImage;
-use nalgebra::{Vector3, Vector4};
+use std::collections::{HashMap, HashSet};
+
+use cool_utils::data_structures::dcel::DCEL;
+use nalgebra::Vector3;
 use v4::{
+    builtin_components::mesh_component::MeshComponent,
     component,
-    ecs::component::{ComponentSystem, UpdateParams},
-    engine_support::texture_support::TextureBundle,
+    ecs::{
+        actions::ActionQueue,
+        component::{ComponentDetails, ComponentId, ComponentSystem, UpdateParams},
+    },
 };
-use wgpu::{Buffer, Device, Queue};
+use wgpu::Device;
+
+use crate::Vertex;
 
 #[component]
 pub struct NetworkGenerationComponent {
-    concentration_texture_bundle: TextureBundle,
-    boundary: Vec<Vector3<f32>>,
-    buf: Buffer,
+    boundary_verts: Vec<Vector3<f32>>,
+    boundary_adjacency_list: HashMap<usize, HashSet<usize>>,
+    #[default]
+    dcel: DCEL,
     max_iter_count: usize,
     #[default(0)]
     current_iter: usize,
     #[default(1.0)]
     branch_dilation_factor: f32,
+    non_edges: HashSet<[usize; 2]>,
+    vessel_edges_component: ComponentId,
+    // display_vessel_edges: ComponentId,
 }
 
 impl NetworkGenerationComponent {
-    async fn fetch_texture(&self, device: &Device, queue: &Queue) -> Rgba32FImage {
-        let tex = self.concentration_texture_bundle.view().texture();
-        let size = self
-            .concentration_texture_bundle
-            .properties()
-            .format
-            .theoretical_memory_footprint(tex.size());
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::wgt::CommandEncoderDescriptor::default());
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(size as u32 / tex.height()),
-                    rows_per_image: Some(tex.height()),
-                },
-            },
-            tex.size(),
-        );
-        queue.submit([encoder.finish()]);
-        let slice = self.buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let data = slice.get_mapped_range();
-        let bytes: &[f32] = bytemuck::cast_slice(&data);
-        let img = Rgba32FImage::from_raw(tex.width(), tex.height(), bytes.to_vec())
-            .expect("Failed to create CPU-side rgba32Float image");
-        drop(data);
-        img
+    fn calc_oxygen_gradient_at_point(
+        point: Vector3<f32>,
+        all_vessel_edges: &[[Vector3<f32>; 2]],
+    ) -> Vector3<f32> {
+        all_vessel_edges
+            .iter()
+            .map(|[p0, p1]| {
+                let vessel_dir = p1 - p0;
+                let offset_pos = point - p0;
+                let proj =
+                    offset_pos.dot(&vessel_dir) / vessel_dir.dot(&vessel_dir) * vessel_dir + p0;
+                let cutoff = 0.08;
+                (cutoff - point.metric_distance(&proj) / 512.0).max(0.0) / cutoff
+                    * (point - proj).normalize()
+            })
+            .sum()
     }
 
-    fn advect_boundary(&self, device: &Device, queue: &Queue) -> Vec<Vector3<f32>> {
-        let img = pollster::block_on(self.fetch_texture(device, queue));
-        let center = self.boundary.iter().sum::<Vector3<f32>>() / self.boundary.len() as f32;
-        let mut new_boundary: Vec<Vector3<f32>> = self
-            .boundary
+    fn advect_boundary(
+        &self,
+        boundary_verts: &[Vector3<f32>],
+        all_vessel_edges: &[[Vector3<f32>; 2]],
+    ) -> Vec<Vector3<f32>> {
+        let center = boundary_verts.iter().sum::<Vector3<f32>>() / boundary_verts.len() as f32;
+        let mut new_boundary: Vec<Vector3<f32>> = boundary_verts
             .iter()
             .map(|pos| (pos - center) * 0.99 + center)
             .collect();
 
         for point in &mut new_boundary {
-            let mut boundary_vector = Vector3::from(
-                Vector4::from(
-                    img.get_pixel((point.x as u32).min(511), (point.y as u32).min(511))
-                        .0,
-                )
-                .xyz(),
-            );
+            let mut boundary_vector = Self::calc_oxygen_gradient_at_point(*point, all_vessel_edges);
             while boundary_vector.norm() > 0.0001 {
                 *point += boundary_vector;
-                boundary_vector = Vector3::from(
-                    Vector4::from(
-                        img.get_pixel((point.x as u32).min(511), (point.y as u32).min(511))
-                            .0,
-                    )
-                    .xyz(),
-                );
+                boundary_vector = Self::calc_oxygen_gradient_at_point(*point, all_vessel_edges);
             }
         }
-        self.buf.unmap();
         new_boundary
     }
 
-    fn get_best_connection_points(&self, low_oxygen_point: Vector3<f32>) -> [Vector3<f32>; 2] {
-        let all_edges: Vec<[Vector3<f32>; 2]> = self
-            .boundary
-            .chunks(2)
-            .map(|chunk| [chunk[0], chunk[1]])
-            .collect();
-        let mut projection_of_central_point_on_edges: Vec<Vector3<f32>> = all_edges
+    fn get_best_connection_points(
+        &self,
+        low_oxygen_point: Vector3<f32>,
+        all_edges: &[[Vector3<f32>; 2]],
+    ) -> [(Vector3<f32>, usize); 2] {
+        let mut projection_of_central_point_on_edges: Vec<(Vector3<f32>, usize)> = all_edges
             .into_iter()
-            .map(|[p0, p1]| {
+            .enumerate()
+            .map(|(i, [p0, p1])| {
                 let dir = p1 - p0;
                 let unclamped_projection =
                     dir.dot(&(low_oxygen_point - p0)) / dir.norm_squared() * dir + p0;
-                Vector3::new(
-                    unclamped_projection.x.clamp(p0.x.min(p1.x), p0.x.max(p1.x)),
-                    unclamped_projection.y.clamp(p0.y.min(p1.y), p0.y.max(p1.y)),
-                    unclamped_projection.z.clamp(p0.z.min(p1.z), p0.z.max(p1.z)),
+                (
+                    Vector3::new(
+                        unclamped_projection.x.clamp(p0.x.min(p1.x), p0.x.max(p1.x)),
+                        unclamped_projection.y.clamp(p0.y.min(p1.y), p0.y.max(p1.y)),
+                        unclamped_projection.z.clamp(p0.z.min(p1.z), p0.z.max(p1.z)),
+                    ),
+                    i,
                 )
             })
             .collect();
 
-        projection_of_central_point_on_edges.sort_by(|a, b| {
+        projection_of_central_point_on_edges.sort_by(|(a, _), (b, _)| {
             (a - low_oxygen_point)
                 .norm_squared()
                 .total_cmp(&(b - low_oxygen_point).norm_squared())
         });
 
-        [projection_of_central_point_on_edges[0], projection_of_central_point_on_edges[1]]
+        [
+            projection_of_central_point_on_edges[0],
+            projection_of_central_point_on_edges[1],
+        ]
+    }
+
+    fn insert_edge_into_adjacency_list(
+        &mut self,
+        edge: [usize; 2],
+        connection_edges: [[usize; 2]; 2],
+    ) {
+        for (i, &vertex_index) in edge.iter().enumerate() {
+            for (j, &connection_vertex_index) in connection_edges[i].iter().enumerate() {
+                let connection_vertex_neighbors = self
+                    .boundary_adjacency_list
+                    .get_mut(&connection_vertex_index)
+                    .unwrap();
+                connection_vertex_neighbors.remove(&connection_edges[i][1 - j]);
+                connection_vertex_neighbors.insert(vertex_index);
+            }
+
+            if let Some(neighbors) = self.boundary_adjacency_list.get_mut(&vertex_index) {
+                neighbors.insert(edge[1 - i]);
+                neighbors.extend(connection_edges[i]);
+            } else {
+                let neighbors = HashSet::from([edge[1 - i], connection_edges[i][0], connection_edges[i][1]]);
+                self.boundary_adjacency_list.insert(vertex_index, neighbors);
+            }
+        }
+    }
+
+    fn update_adjacency_list(
+        &mut self,
+        low_oxygen_point: Vector3<f32>,
+        connection_points: [(Vector3<f32>, usize); 2],
+        edges_indices: &[[usize; 2]],
+    ) {
+        let merged_connection_points = connection_points.map(|(connection_vertex, _)| {
+            if let Some(existing_connection) = (0..self.boundary_verts.len())
+                .filter(|&i| (self.boundary_verts[i] - connection_vertex).norm_squared() < 0.0001)
+                .next()
+            {
+                existing_connection
+            } else {
+                self.boundary_verts.push(connection_vertex);
+                self.boundary_verts.len() - 1
+            }
+        });
+
+        // self.boundary_verts.push(low_oxygen_point);
+
+        let edges = [merged_connection_points]; //merged_connection_points.map(|p| [p, self.boundary_verts.len() - 1]);
+
+        for edge in edges {
+            self.insert_edge_into_adjacency_list(
+                edge,
+                connection_points.map(|(_, edge_index)| edges_indices[edge_index]),
+            );
+        }
+    }
+
+    fn recalculate_dcel(&mut self) {
+        self.dcel = DCEL::new(
+            &self
+                .boundary_verts
+                .iter()
+                .map(|p| nalgebra::Vector2::from(p.xy()))
+                .collect::<Vec<_>>(),
+            &self.boundary_adjacency_list,
+        );
     }
 }
 
 impl ComponentSystem for NetworkGenerationComponent {
+    fn initialize(&mut self, _device: &Device) -> ActionQueue {
+        self.recalculate_dcel();
+
+        self.set_initialized();
+        Vec::new()
+    }
+
     fn update(
         &mut self,
-        UpdateParams { device, queue, .. }: UpdateParams<'_, '_>,
-    ) -> v4::ecs::actions::ActionQueue {
+        UpdateParams {
+            other_components,
+            device,
+            queue,
+            ..
+        }: UpdateParams<'_, '_>,
+    ) -> ActionQueue {
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
         }
 
-        let advected_boundary = self.advect_boundary(device, queue);
-        let central_lowest_oxygen_point =
-            advected_boundary.iter().sum::<Vector3<f32>>() / advected_boundary.len() as f32;
+        for face_index in 0..self.dcel.faces().len() {
+            let face = &self.dcel.faces()[face_index];
+            println!(
+                "face: polygon({:?})",
+                face.iter()
+                    .map(|&index| {
+                        let vert = self.boundary_verts[index];
+                        (vert.x, vert.y)
+                    })
+                    .collect::<Vec<_>>()
+            );
+            let filtered_edges_indices: Vec<[usize; 2]> = self
+                .dcel
+                .edges_of_face(face_index)
+                .iter()
+                .filter(|edge| {
+                    !self
+                        .non_edges
+                        .contains(&[edge[0].min(edge[1]), edge[0].max(edge[1])])
+                })
+                .copied()
+                .collect();
 
-        let connection_points = self.get_best_connection_points(central_lowest_oxygen_point);
+            let filtered_edges: Vec<[Vector3<f32>; 2]> = filtered_edges_indices
+                .iter()
+                .map(|edge| edge.map(|index| self.boundary_verts[index]))
+                .collect();
 
-        let edges: Vec<[Vector3<f32>; 2]> = connection_points.iter().flat_map(|connection| {
-            let branch_point = connection.lerp(&central_lowest_oxygen_point, 0.5);
-            let main_edge = [*connection, branch_point];
-            let first_path_point = (central_lowest_oxygen_point - main_edge[1]).cross(&Vector3::new(0.0, 0.0, self.branch_dilation_factor)) + central_lowest_oxygen_point;
+            let boundary_verts: Vec<Vector3<f32>> =
+                face.iter().map(|i| self.boundary_verts[*i]).collect();
+            let advected_boundary = self.advect_boundary(&boundary_verts, &filtered_edges);
+            let central_lowest_oxygen_point =
+                advected_boundary.iter().sum::<Vector3<f32>>() / advected_boundary.len() as f32;
 
-            let second_path_point = (central_lowest_oxygen_point - main_edge[1]).cross(&Vector3::new(0.0, 0.0, -self.branch_dilation_factor)) + central_lowest_oxygen_point;
+            let connection_points =
+                self.get_best_connection_points(central_lowest_oxygen_point, &filtered_edges);
 
-            [main_edge].into_iter().chain([[branch_point, first_path_point], [branch_point, second_path_point]])
-        }).collect();
+            self.update_adjacency_list(central_lowest_oxygen_point, connection_points, &filtered_edges_indices);
 
-        for edge in edges {
-            println!("polygon(({}, {}), ({}, {}))", edge[0].x, edge[0].y, edge[1].x, edge[1].y);
+            let new_edge = connection_points.map(|(point, _)| point);
+
+            if let Some(component) = other_components
+                .iter_mut()
+                .filter(|comp| comp.id() == self.vessel_edges_component)
+                .next()
+            {
+                let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
+                mesh_component.update_vertices(
+                    vec![new_edge]
+                        .into_flattened()
+                        .iter()
+                        .map(|position| Vertex {
+                            pos: (position / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
+                            color: [0.5, 0.0, 0.5, 1.0],
+                        })
+                        .collect(),
+                    None,
+                    device,
+                    queue,
+                );
+            }
         }
 
         self.current_iter += 1;
+        self.recalculate_dcel();
 
         Vec::new()
     }
