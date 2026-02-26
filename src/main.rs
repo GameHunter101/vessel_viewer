@@ -6,7 +6,6 @@ use v4::{
     V4,
     builtin_components::mesh_component::{MeshComponent, VertexData, VertexDescriptor},
     ecs::{
-        component::ComponentSystem,
         compute::Compute,
         material::{ShaderAttachment, ShaderBufferAttachment, ShaderTextureAttachment},
     },
@@ -54,16 +53,19 @@ async fn main() {
 
     let oxygen_compute_edges: Vec<ComputeEdge> = vessels
         .chunks(2)
-        .map(|points| ComputeEdge {
-            p1: [
-                (points[0].pos[0] + 1.0) * 256.0,
-                (points[0].pos[1] + 1.0) * 256.0,
-            ],
-            p2: [
-                (points[1].pos[0] + 1.0) * 256.0,
-                (points[1].pos[1] + 1.0) * 256.0,
-            ],
+        .map(|points| {
+            ComputeEdge::new(
+                [
+                    (points[0].pos[0] + 1.0) * 256.0,
+                    (points[0].pos[1] + 1.0) * 256.0,
+                ],
+                [
+                    (points[1].pos[0] + 1.0) * 256.0,
+                    (points[1].pos[1] + 1.0) * 256.0,
+                ],
+            )
         })
+        .chain([ComputeEdge::default(); 62])
         .collect();
 
     let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0, 0.0, 0.0, 1.0]));
@@ -92,28 +94,6 @@ async fn main() {
             ..Default::default()
         },
     );
-
-    let mut compute = Compute::builder()
-        .attachments(vec![
-            ShaderAttachment::Buffer(ShaderBufferAttachment::new(
-                device,
-                bytemuck::cast_slice(&oxygen_compute_edges),
-                wgpu::BufferBindingType::Uniform,
-                wgpu::ShaderStages::COMPUTE,
-                wgpu::BufferUsages::empty(),
-            )),
-            ShaderAttachment::Texture(ShaderTextureAttachment {
-                texture_bundle: oxygen_concentration_texture_bundle.clone(),
-                visibility: wgpu::ShaderStages::COMPUTE,
-            }),
-        ])
-        .shader_path("shaders/oxygen_compute.wgsl")
-        .workgroup_counts((512, 512, 1))
-        .build();
-
-    compute.initialize(device);
-
-    rendering_manager.individual_compute_execution(&[compute]);
 
     let boundary: Vec<Vector3<f32>> = vessels
         .iter()
@@ -170,11 +150,30 @@ async fn main() {
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
                     boundary_adjacency_list: boundary_adjacency_list,
-                    max_iter_count: 3,
+                    max_iter_count: 10,
                     non_edges: HashSet::from([[0, 3], [1, 2]]),
                     vessel_edges_component: ident("vessel_edges"),
+                    display_vessel_edges_compute: ident("vessel_compute"),
                 )
-            ]
+            ],
+            computes: [Compute(
+                    attachments: vec![
+                        ShaderAttachment::Buffer(ShaderBufferAttachment::new(
+                            device,
+                            bytemuck::cast_slice(&oxygen_compute_edges),
+                            wgpu::BufferBindingType::Uniform,
+                            wgpu::ShaderStages::COMPUTE,
+                            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        )),
+                        ShaderAttachment::Texture(ShaderTextureAttachment {
+                            texture_bundle: oxygen_concentration_texture_bundle.clone(),
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                        }),
+                    ],
+                shader_path: "shaders/oxygen_compute.wgsl",
+                workgroup_counts: (512, 512, 1),
+                ident: "vessel_compute"
+            )],
         },
         "vessels" = {
             material: {
@@ -225,9 +224,22 @@ impl VertexDescriptor for Vertex {
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-struct ComputeEdge {
+pub struct ComputeEdge {
+    p0: [f32; 2],
     p1: [f32; 2],
-    p2: [f32; 2],
+    // enabled: u32,
+    // padding: [u32; 2],
+}
+
+impl ComputeEdge {
+    pub fn new(p0: [f32; 2], p1: [f32; 2]) -> Self {
+        Self {
+            p0,
+            p1,
+            // enabled: 1,
+            // padding: [0; 2],
+        }
+    }
 }
 
 #[repr(C)]

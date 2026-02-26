@@ -8,11 +8,12 @@ use v4::{
     ecs::{
         actions::ActionQueue,
         component::{ComponentDetails, ComponentId, ComponentSystem, UpdateParams},
+        material::ShaderAttachment,
     },
 };
 use wgpu::Device;
 
-use crate::Vertex;
+use crate::{ComputeEdge, Vertex};
 
 #[component]
 pub struct NetworkGenerationComponent {
@@ -27,7 +28,7 @@ pub struct NetworkGenerationComponent {
     branch_dilation_factor: f32,
     non_edges: HashSet<[usize; 2]>,
     vessel_edges_component: ComponentId,
-    // display_vessel_edges: ComponentId,
+    display_vessel_edges_compute: ComponentId,
 }
 
 impl NetworkGenerationComponent {
@@ -93,10 +94,13 @@ impl NetworkGenerationComponent {
             })
             .collect();
 
-        projection_of_central_point_on_edges.sort_by(|(a, _), (b, _)| {
-            (a - low_oxygen_point)
+        projection_of_central_point_on_edges.sort_by(|(a, a_edge_index), (b, b_edge_index)| {
+            let a_edge_ratio = ((all_edges[*a_edge_index][0] - a).norm() / (all_edges[*a_edge_index][1] - a).norm()).abs();
+            let b_edge_ratio = ((all_edges[*b_edge_index][0] - b).norm() / (all_edges[*b_edge_index][1] - b).norm()).abs();
+            a_edge_ratio.total_cmp(&b_edge_ratio)
+            /* (a - low_oxygen_point)
                 .norm_squared()
-                .total_cmp(&(b - low_oxygen_point).norm_squared())
+                .total_cmp(&(b - low_oxygen_point).norm_squared()) */
         });
 
         [
@@ -124,7 +128,8 @@ impl NetworkGenerationComponent {
                 neighbors.insert(edge[1 - i]);
                 neighbors.extend(connection_edges[i]);
             } else {
-                let neighbors = HashSet::from([edge[1 - i], connection_edges[i][0], connection_edges[i][1]]);
+                let neighbors =
+                    HashSet::from([edge[1 - i], connection_edges[i][0], connection_edges[i][1]]);
                 self.boundary_adjacency_list.insert(vertex_index, neighbors);
             }
         }
@@ -186,6 +191,7 @@ impl ComponentSystem for NetworkGenerationComponent {
             other_components,
             device,
             queue,
+            computes,
             ..
         }: UpdateParams<'_, '_>,
     ) -> ActionQueue {
@@ -195,15 +201,6 @@ impl ComponentSystem for NetworkGenerationComponent {
 
         for face_index in 0..self.dcel.faces().len() {
             let face = &self.dcel.faces()[face_index];
-            println!(
-                "face: polygon({:?})",
-                face.iter()
-                    .map(|&index| {
-                        let vert = self.boundary_verts[index];
-                        (vert.x, vert.y)
-                    })
-                    .collect::<Vec<_>>()
-            );
             let filtered_edges_indices: Vec<[usize; 2]> = self
                 .dcel
                 .edges_of_face(face_index)
@@ -230,7 +227,11 @@ impl ComponentSystem for NetworkGenerationComponent {
             let connection_points =
                 self.get_best_connection_points(central_lowest_oxygen_point, &filtered_edges);
 
-            self.update_adjacency_list(central_lowest_oxygen_point, connection_points, &filtered_edges_indices);
+            self.update_adjacency_list(
+                central_lowest_oxygen_point,
+                connection_points,
+                &filtered_edges_indices,
+            );
 
             let new_edge = connection_points.map(|(point, _)| point);
 
@@ -249,10 +250,28 @@ impl ComponentSystem for NetworkGenerationComponent {
                             color: [0.5, 0.0, 0.5, 1.0],
                         })
                         .collect(),
-                    None,
+                    Some(0),
                     device,
                     queue,
                 );
+                let verts = &mesh_component.vertices()[0];
+                if let Some(compute) = computes
+                    .iter_mut()
+                    .filter(|comp| comp.id() == self.display_vessel_edges_compute)
+                    .next()
+                    && let ShaderAttachment::Buffer(buf) = &mut compute.attachments_mut()[0]
+                {
+                    let edges: Vec<ComputeEdge> = verts
+                        .chunks(2)
+                        .map(|chunk| {
+                            ComputeEdge::new(
+                                [(chunk[0].pos[0] + 1.0) * 256.0, (chunk[0].pos[1] + 1.0) * 256.0],
+                                [(chunk[1].pos[0] + 1.0) * 256.0, (chunk[1].pos[1] + 1.0) * 256.0],
+                            )
+                        })
+                        .collect();
+                    buf.update_buffer(bytemuck::cast_slice(&edges), device, queue);
+                }
             }
         }
 

@@ -1,7 +1,10 @@
 [package]
 name = "vessel_viewer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
+
+[profile.release]
+debug = true
 
 [dependencies]
 wgpu = "28.0.0"
