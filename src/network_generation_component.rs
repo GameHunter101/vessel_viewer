@@ -26,6 +26,8 @@ pub struct NetworkGenerationComponent {
     current_iter: usize,
     #[default(1.0)]
     branch_dilation_factor: f32,
+    #[default(40.0)]
+    vessel_oxygen_transport_distance: f32,
     non_edges: HashSet<[usize; 2]>,
     vessel_edges_component: ComponentId,
     display_vessel_edges_compute: ComponentId,
@@ -35,6 +37,7 @@ impl NetworkGenerationComponent {
     fn calc_oxygen_gradient_at_point(
         point: Vector3<f32>,
         all_vessel_edges: &[[Vector3<f32>; 2]],
+        vessel_oxygen_transport_distance: f32,
     ) -> Vector3<f32> {
         all_vessel_edges
             .iter()
@@ -43,8 +46,7 @@ impl NetworkGenerationComponent {
                 let offset_pos = point - p0;
                 let proj =
                     offset_pos.dot(&vessel_dir) / vessel_dir.dot(&vessel_dir) * vessel_dir + p0;
-                let cutoff = 0.08;
-                (cutoff - point.metric_distance(&proj) / 512.0).max(0.0) / cutoff
+                (vessel_oxygen_transport_distance - point.metric_distance(&proj)).max(0.0)
                     * (point - proj).normalize()
             })
             .sum()
@@ -61,11 +63,20 @@ impl NetworkGenerationComponent {
             .map(|pos| (pos - center) * 0.99 + center)
             .collect();
 
-        for point in &mut new_boundary {
-            let mut boundary_vector = Self::calc_oxygen_gradient_at_point(*point, all_vessel_edges);
+        for (i, point) in new_boundary.iter_mut().enumerate() {
+            let mut boundary_vector = Self::calc_oxygen_gradient_at_point(
+                *point,
+                all_vessel_edges,
+                self.vessel_oxygen_transport_distance,
+            );
             while boundary_vector.norm() > 0.0001 {
+                // println!("advecting {i}, vector size: {}, pos: {:?}", boundary_vector.norm(), (point.x, point.y));
                 *point += boundary_vector;
-                boundary_vector = Self::calc_oxygen_gradient_at_point(*point, all_vessel_edges);
+                boundary_vector = Self::calc_oxygen_gradient_at_point(
+                    *point,
+                    all_vessel_edges,
+                    self.vessel_oxygen_transport_distance,
+                );
             }
         }
         new_boundary
@@ -95,12 +106,16 @@ impl NetworkGenerationComponent {
             .collect();
 
         projection_of_central_point_on_edges.sort_by(|(a, a_edge_index), (b, b_edge_index)| {
-            let a_edge_ratio = ((all_edges[*a_edge_index][0] - a).norm() / (all_edges[*a_edge_index][1] - a).norm()).abs();
-            let b_edge_ratio = ((all_edges[*b_edge_index][0] - b).norm() / (all_edges[*b_edge_index][1] - b).norm()).abs();
+            let a_edge_ratio = ((all_edges[*a_edge_index][0] - a).norm()
+                / (all_edges[*a_edge_index][1] - a).norm())
+            .abs();
+            let b_edge_ratio = ((all_edges[*b_edge_index][0] - b).norm()
+                / (all_edges[*b_edge_index][1] - b).norm())
+            .abs();
             a_edge_ratio.total_cmp(&b_edge_ratio)
             /* (a - low_oxygen_point)
-                .norm_squared()
-                .total_cmp(&(b - low_oxygen_point).norm_squared()) */
+            .norm_squared()
+            .total_cmp(&(b - low_oxygen_point).norm_squared()) */
         });
 
         [
@@ -175,6 +190,47 @@ impl NetworkGenerationComponent {
             &self.boundary_adjacency_list,
         );
     }
+
+    fn simple_advect(&self, index_in_face: usize, face: &[usize]) -> Vector3<f32> {
+        let face_center = face
+            .iter()
+            .map(|i| self.boundary_verts[*i])
+            .sum::<Vector3<f32>>()
+            / face.len() as f32;
+        let real_index = face[index_in_face];
+        let neighbors = [
+            face[(index_in_face + 1) % face.len()],
+            face[(index_in_face as i32 - 1).rem_euclid(face.len() as i32) as usize],
+        ];
+        let advection_directions = neighbors.map(|neighbor_index| {
+            let edge = [
+                real_index.min(neighbor_index),
+                real_index.max(neighbor_index),
+            ];
+            if self.non_edges.contains(&edge) {
+                Vector3::zeros()
+            } else {
+                let edge = edge.map(|i| self.boundary_verts[i]);
+                /* if real_index < neighbor_index {
+                    self.boundary_verts[neighbor_index] - self.boundary_verts[real_index]
+                } else {
+                    self.boundary_verts[real_index] - self.boundary_verts[neighbor_index]
+                }; */
+                let normal = (edge[1] - edge[0])
+                    .cross(&Vector3::new(0.0, 0.0, -1.0))
+                    .normalize();
+                if normal.x.is_nan() {
+                    // println!("Nan normalizing: from {:?} to {:?}", (edge[0].x, edge[0].y), (edge[1].x, edge[1].y));
+                    println!("Real: {real_index}, neighbors: {neighbors:?}");
+                }
+                let normal_aligned_inwards = (face_center - self.boundary_verts[real_index])
+                    .dot(&normal)
+                    .signum();
+                normal * normal_aligned_inwards * self.vessel_oxygen_transport_distance
+            }
+        });
+        self.boundary_verts[real_index] + advection_directions.into_iter().sum::<Vector3<f32>>()
+    }
 }
 
 impl ComponentSystem for NetworkGenerationComponent {
@@ -199,8 +255,14 @@ impl ComponentSystem for NetworkGenerationComponent {
             return Vec::new();
         }
 
+        println!("----");
+        if self.current_iter == 4 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
         for face_index in 0..self.dcel.faces().len() {
             let face = &self.dcel.faces()[face_index];
+            println!("polygon({:?})", face.iter().map(|&i| (self.boundary_verts[i].x, self.boundary_verts[i].y)).collect::<Vec<_>>());
             let filtered_edges_indices: Vec<[usize; 2]> = self
                 .dcel
                 .edges_of_face(face_index)
@@ -218,11 +280,25 @@ impl ComponentSystem for NetworkGenerationComponent {
                 .map(|edge| edge.map(|index| self.boundary_verts[index]))
                 .collect();
 
-            let boundary_verts: Vec<Vector3<f32>> =
-                face.iter().map(|i| self.boundary_verts[*i]).collect();
-            let advected_boundary = self.advect_boundary(&boundary_verts, &filtered_edges);
+            /* let advected_boundary = self.advect_boundary(&boundary_verts, &filtered_edges);
             let central_lowest_oxygen_point =
-                advected_boundary.iter().sum::<Vector3<f32>>() / advected_boundary.len() as f32;
+                advected_boundary.iter().sum::<Vector3<f32>>() / advected_boundary.len() as f32; */
+            let central_lowest_oxygen_point = (0..face.len())
+                .map(|i| self.simple_advect(i, &face))
+                .sum::<Vector3<f32>>()
+                / face.len() as f32;
+            /* println!(
+                "Advected: {:?}, final: {:?}",
+                advected_boundary
+                    .iter()
+                    .map(|p| (p.x, p.y))
+                    .collect::<Vec<_>>(),
+                final_central_boundary
+            ); */
+
+            if central_lowest_oxygen_point.x.is_nan() {
+                println!("central point: {:?}, face len: {}", (central_lowest_oxygen_point.x, central_lowest_oxygen_point.y), face.len());
+            }
 
             let connection_points =
                 self.get_best_connection_points(central_lowest_oxygen_point, &filtered_edges);
@@ -265,12 +341,28 @@ impl ComponentSystem for NetworkGenerationComponent {
                         .chunks(2)
                         .map(|chunk| {
                             ComputeEdge::new(
-                                [(chunk[0].pos[0] + 1.0) * 256.0, (chunk[0].pos[1] + 1.0) * 256.0],
-                                [(chunk[1].pos[0] + 1.0) * 256.0, (chunk[1].pos[1] + 1.0) * 256.0],
+                                [
+                                    (chunk[0].pos[0] + 1.0) * 256.0,
+                                    (chunk[0].pos[1] + 1.0) * 256.0,
+                                ],
+                                [
+                                    (chunk[1].pos[0] + 1.0) * 256.0,
+                                    (chunk[1].pos[1] + 1.0) * 256.0,
+                                ],
                             )
                         })
                         .collect();
-                    buf.update_buffer(bytemuck::cast_slice(&edges), device, queue);
+                    let additional_edges = 64 - edges.len();
+                    buf.update_buffer(
+                        bytemuck::cast_slice(
+                            &edges
+                                .into_iter()
+                                .chain(vec![ComputeEdge::default(); additional_edges])
+                                .collect::<Vec<_>>(),
+                        ),
+                        device,
+                        queue,
+                    );
                 }
             }
         }

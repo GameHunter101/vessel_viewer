@@ -150,7 +150,7 @@ async fn main() {
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
                     boundary_adjacency_list: boundary_adjacency_list,
-                    max_iter_count: 10,
+                    max_iter_count: 5,
                     non_edges: HashSet::from([[0, 3], [1, 2]]),
                     vessel_edges_component: ident("vessel_edges"),
                     display_vessel_edges_compute: ident("vessel_compute"),

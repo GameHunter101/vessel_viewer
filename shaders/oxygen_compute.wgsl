@@ -7,6 +7,11 @@ struct VesselEdge {
     p2: vec2<f32>,
 }
 
+fn is_nan(val: f32) -> bool {
+    let min: f32 = -20000000.0;
+    return max(val, min) == min;
+}
+
 @compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -14,7 +19,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var i = 0; i < 64; i++) {
         let vessel = vessel_edges[i];
         if (vessel.p1.x == vessel.p2.x && vessel.p1.y == vessel.p2.y) {
-            continue;
+            break;
         }
 
         let pos = vec2<f32>(id.xy);
@@ -26,7 +31,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let proj = clamp(dot(offset_pos, vessel_dir) / dot(vessel_dir, vessel_dir) * vessel_dir + vessel.p1, low_bound, high_bound);
         let cutoff = 0.08;
         let dist = max(cutoff - distance(pos, proj) / 512.0, 0.0) / cutoff * normalize(pos - proj);
+        let highval = 1000000.0;
         res += dist;
+        if min(vessel.p1.x, highval) == highval {
+            res = vec2f(1.0, 0.0);// vec2f(distance(vec2f(id.xy), vessel_edges[0].p1)) / 512.0;
+            break;
+        }
         /* let prev = textureLoad(oxygen_concentration, id.xy);
         textureStore(oxygen_concentration, id.xy, prev + vec4f(dist, 0.0, 0.0)); */
     }
