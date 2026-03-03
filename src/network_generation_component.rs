@@ -15,6 +15,13 @@ use wgpu::{Device, Queue};
 
 use crate::{ComputeEdge, Vertex};
 
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkDetails {
+    pub prioritize_edge_length_weight: f32,
+    pub prioritize_orthogonality_weight: f32,
+    pub branch_dilation_factor: f32,
+}
+
 #[component]
 pub struct NetworkGenerationComponent {
     boundary_verts: Vec<Vector3<f32>>,
@@ -24,8 +31,7 @@ pub struct NetworkGenerationComponent {
     max_iter_count: usize,
     #[default(0)]
     current_iter: usize,
-    #[default(1.0)]
-    branch_dilation_factor: f32,
+    network_parameters: NetworkDetails,
     #[default(40.0)]
     vessel_oxygen_transport_distance: f32,
     non_edges: HashSet<[usize; 2]>,
@@ -78,8 +84,6 @@ impl NetworkGenerationComponent {
         &self,
         low_oxygen_point: Vector3<f32>,
         face_edges: &[[Vector3<f32>; 2]],
-        edge_length_weight: f32,
-        perpendicular_weight: f32,
     ) -> [(Vector3<f32>, usize); 2] {
         let (longest_edge_index, longest_edge) = face_edges
             .iter()
@@ -126,7 +130,7 @@ impl NetworkGenerationComponent {
                     let v1 = face_edges[edge_index][1];
                     let edge_ratio = (1.0
                         - ((v0 - vert).norm() - (v1 - vert).norm()).abs() / (v1 - v0).norm())
-                        * lerp(1.0, (v1 - v0).norm(), edge_length_weight);
+                        * lerp(1.0, (v1 - v0).norm(), self.network_parameters.prioritize_edge_length_weight);
 
                     let perpendicular = 1.0
                         - (vert - longest_edge_projection)
@@ -134,17 +138,15 @@ impl NetworkGenerationComponent {
                             .dot(&(longest_edge[1] - longest_edge[0]).normalize())
                             .abs();
 
-                    let weight = lerp(edge_ratio, perpendicular, perpendicular_weight);
+                    let weight = lerp(edge_ratio, perpendicular, self.network_parameters.prioritize_orthogonality_weight);
 
                     if weight.is_nan() {
-                        println!("NaN weight: edge_ratio: {edge_ratio}, perp: {perpendicular}");
+                        println!("NaN weight: edge_ratio: {edge_ratio}, perp: {perpendicular}, v0: {:?}, v1: {:?}", (v0.x, v0.y), (v1.x, v1.y));
                     }
 
                     ((vert, edge_index), weight)
                 })
                 .collect();
-
-        // println!("Weights: {:?}", connection_candidate_weights.iter().map(|((v, _), w)| ((v.x, v.y), w)).collect::<Vec<_>>());
 
         let other_connection = connection_candidate_weights
             .into_iter()
@@ -169,13 +171,15 @@ impl NetworkGenerationComponent {
                     .boundary_adjacency_list
                     .get_mut(&connection_vertex_index)
                     .unwrap();
-                connection_vertex_neighbors.remove(&connection_edges[i][1 - j]);
-                connection_vertex_neighbors.insert(vertex_index);
+                if connection_vertex_index != vertex_index {
+                    connection_vertex_neighbors.remove(&connection_edges[i][1 - j]);
+                    connection_vertex_neighbors.insert(vertex_index);
+                }
             }
 
             if let Some(neighbors) = self.boundary_adjacency_list.get_mut(&vertex_index) {
-                neighbors.insert(edge[1 - i]);
-                neighbors.extend(connection_edges[i]);
+                let temp = connection_edges[i].into_iter().filter(|&i| i != vertex_index).chain([edge[1-i]]).collect::<Vec<_>>();
+                neighbors.extend(temp);
             } else {
                 let neighbors =
                     HashSet::from([edge[1 - i], connection_edges[i][0], connection_edges[i][1]]);
@@ -296,35 +300,31 @@ impl ComponentSystem for NetworkGenerationComponent {
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
         }
-
-        let face_index = self
+        let face_areas = self
             .dcel
             .faces()
             .iter()
             .enumerate()
             .map(|(i, face)| {
-                let area = (0..face.len())
-                    .map(|vert_in_face_idx| {
-                        self.boundary_verts[face[vert_in_face_idx]]
-                            .cross(&self.boundary_verts[face[(vert_in_face_idx + 1) % face.len()]])
+                let area = face
+                    .iter().enumerate()
+                    .map(|(i, &vert_index)| {
+                        let point_indices = [vert_index, face[(i + 1) % face.len()]];
+                        let vectors = point_indices.map(|i| self.boundary_verts[i]);
+                        vectors[0].cross(&vectors[1])
                     })
                     .sum::<Vector3<f32>>()
                     .norm()
                     / 2.0;
                 (i, area)
             })
+            .collect::<Vec<_>>();
+        let face_index = face_areas
+            .iter()
             .max_by(|(_, a_area), (_, b_area)| a_area.total_cmp(b_area))
-            .unwrap()
-            .0;
+            .unwrap().0;
 
-        // for face_index in (0..self.dcel.faces().len()) {
         let face = &self.dcel.faces()[face_index];
-        println!(
-            "polygon({:?})",
-            face.iter()
-                .map(|&i| (self.boundary_verts[i].x, self.boundary_verts[i].y))
-                .collect::<Vec<_>>()
-        );
         let filtered_edges_indices: Vec<[usize; 2]> = self
             .dcel
             .edges_of_face(face_index)
@@ -346,18 +346,10 @@ impl ComponentSystem for NetworkGenerationComponent {
             .map(|i| self.simple_advect(i, &face))
             .sum::<Vector3<f32>>()
             / face.len() as f32;
-        println!(
-            "Center: {:?}",
-            (central_lowest_oxygen_point.x, central_lowest_oxygen_point.y)
-        );
 
         let connection_points =
-            self.get_best_connection_points(central_lowest_oxygen_point, &filtered_edges, 0.5, 0.8);
+            self.get_best_connection_points(central_lowest_oxygen_point, &filtered_edges);
 
-        println!(
-            "Connections: {:?}",
-            connection_points.map(|(p, _)| (p.x, p.y)),
-        );
         self.update_adjacency_list(
             central_lowest_oxygen_point,
             connection_points,

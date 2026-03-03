@@ -14,7 +14,7 @@ use v4::{
 };
 use wgpu::vertex_attr_array;
 
-use crate::network_generation_component::NetworkGenerationComponent;
+use crate::network_generation_component::{NetworkGenerationComponent, NetworkDetails};
 
 mod network_generation_component;
 
@@ -150,7 +150,12 @@ async fn main() {
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
                     boundary_adjacency_list: boundary_adjacency_list,
-                    max_iter_count: 40,
+                    max_iter_count: 20,
+                    network_parameters: NetworkDetails {
+                        prioritize_edge_length_weight: 1.0,
+                        prioritize_orthogonality_weight: 1.0,
+                        branch_dilation_factor: 1.0,
+                    },
                     non_edges: HashSet::from([[0, 3], [1, 2]]),
                     vessel_edges_component: ident("vessel_edges"),
                     display_vessel_edges_compute: ident("vessel_compute"),
