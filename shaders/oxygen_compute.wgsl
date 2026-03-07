@@ -1,4 +1,4 @@
-@group(0) @binding(0) var<uniform> vessel_edges: array<VesselEdge, 64>;
+@group(0) @binding(0) var<uniform> vessel_edges: array<VesselEdge, 128>;
 
 @group(0) @binding(1) var oxygen_concentration: texture_storage_2d<rgba32float, read_write>;
 
@@ -16,7 +16,7 @@ fn is_nan(val: f32) -> bool {
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var res = vec2f(0.0);
-    for (var i = 0; i < 64; i++) {
+    for (var i = 0; i < 128; i++) {
         let vessel = vessel_edges[i];
         if (vessel.p1.x == vessel.p2.x && vessel.p1.y == vessel.p2.y) {
             break;

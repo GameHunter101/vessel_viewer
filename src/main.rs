@@ -32,24 +32,7 @@ async fn main() {
     let device = rendering_manager.device();
     let queue = rendering_manager.queue();
 
-    let vessels = vec![
-        Vertex {
-            pos: [-1.0, -0.85, 0.0],
-            color: [1.0, 0.0, 0.0, 1.0],
-        },
-        Vertex {
-            pos: [1.0, -0.85, 0.0],
-            color: [1.0, 0.0, 0.0, 1.0],
-        },
-        Vertex {
-            pos: [1.0, 0.85, 0.0],
-            color: [0.0, 0.0, 1.0, 1.0],
-        },
-        Vertex {
-            pos: [-1.0, 0.85, 0.0],
-            color: [0.0, 0.0, 1.0, 1.0],
-        },
-    ];
+    let (vessels, boundary, boundary_adjacency_list) = initialize_points();
 
     let oxygen_compute_edges: Vec<ComputeEdge> = vessels
         .chunks(2)
@@ -65,7 +48,7 @@ async fn main() {
                 ],
             )
         })
-        .chain([ComputeEdge::default(); 62])
+        .chain([ComputeEdge::default(); 126])
         .collect();
 
     let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0, 0.0, 0.0, 1.0]));
@@ -94,23 +77,6 @@ async fn main() {
             ..Default::default()
         },
     );
-
-    let boundary: Vec<Vector3<f32>> = vessels
-        .iter()
-        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * 256.0)
-        .collect();
-
-    let boundary_adjacency_list: HashMap<usize, HashSet<usize>> = (0..boundary.len())
-        .map(|i| {
-            (
-                i,
-                HashSet::from_iter([
-                    (i as i32 - 1).rem_euclid(boundary.len() as i32) as usize,
-                    (i + 1) % boundary.len(),
-                ]),
-            )
-        })
-        .collect();
 
     scene! {
         scene: vessel_viewer,
@@ -150,10 +116,10 @@ async fn main() {
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
                     boundary_adjacency_list: boundary_adjacency_list,
-                    max_iter_count: 20,
+                    max_iter_count: 100,
                     network_parameters: NetworkDetails {
-                        prioritize_edge_length_weight: 1.0,
-                        prioritize_orthogonality_weight: 1.0,
+                        prioritize_edge_length_weight: 0.1,
+                        prioritize_orthogonality_weight: 0.0,
                         branch_dilation_factor: 1.0,
                     },
                     non_edges: HashSet::from([[0, 3], [1, 2]]),
@@ -265,4 +231,44 @@ impl VertexDescriptor for DisplayVertex {
     ) -> Self {
         Self { pos, tex_coords }
     }
+}
+
+pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>, HashMap<usize, HashSet<usize>>) {
+    let vessels = vec![
+        Vertex {
+            pos: [-1.0, -0.85, 0.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+        Vertex {
+            pos: [1.0, -0.85, 0.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+        Vertex {
+            pos: [1.0, 0.85, 0.0],
+            color: [0.0, 0.0, 1.0, 1.0],
+        },
+        Vertex {
+            pos: [-1.0, 0.85, 0.0],
+            color: [0.0, 0.0, 1.0, 1.0],
+        },
+    ];
+
+    let boundary: Vec<Vector3<f32>> = vessels
+        .iter()
+        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * 256.0)
+        .collect();
+
+    let boundary_adjacency_list: HashMap<usize, HashSet<usize>> = (0..boundary.len())
+        .map(|i| {
+            (
+                i,
+                HashSet::from_iter([
+                    (i as i32 - 1).rem_euclid(boundary.len() as i32) as usize,
+                    (i + 1) % boundary.len(),
+                ]),
+            )
+        })
+        .collect();
+
+    (vessels, boundary, boundary_adjacency_list)
 }

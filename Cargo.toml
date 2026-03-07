@@ -1,6 +1,6 @@
 [package]
 name = "vessel_viewer"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 
 [profile.release]
@@ -17,3 +17,4 @@ bytemuck = "1.25.0"
 winit = { version = "0.29.15" }
 image = "0.25.9"
 pollster = "0.4.0"
+egui = "0.33.3"
