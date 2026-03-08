@@ -181,6 +181,87 @@ impl NetworkGenerationComponent {
             .map(|split| Self::get_face_area(&split))
     }
 
+    fn calculate_connection_candidate_weight(
+        &self,
+        projected_candidate: Vector3<f32>,
+        edge_index: usize,
+        face: Vec<usize>,
+        face_edges: &[[Vector3<f32>; 2]],
+        face_edges_indices: &[[usize; 2]],
+        longest_edge_projection: Vector3<f32>,
+        longest_edge: &[Vector3<f32>; 2],
+        longest_edge_index: usize,
+    ) -> ((Vector3<f32>, usize), f32) {
+        let v0 = face_edges[edge_index][0];
+        let v1 = face_edges[edge_index][1];
+
+        let edge_shrink_dir = (v1 - v0).normalize() * self.vessel_oxygen_transport_distance;
+        let bounded_candidate = Self::clamp_point_on_edge(
+            projected_candidate,
+            [v0 + edge_shrink_dir, v1 - edge_shrink_dir],
+        );
+
+        let edge_ratio = (1.0
+            - ((v0 - bounded_candidate).norm() - (v1 - bounded_candidate).norm()).abs()
+                / (v1 - v0).norm())
+            * lerp(
+                1.0,
+                (v1 - v0).norm(),
+                self.network_parameters.prioritize_edge_length_weight,
+            );
+
+        let perpendicular = 1.0
+            - (bounded_candidate - longest_edge_projection)
+                .normalize()
+                .dot(&(longest_edge[1] - longest_edge[0]).normalize())
+                .abs();
+
+        let connection_edges =
+            [longest_edge_index, edge_index].map(|edge_index| face_edges_indices[edge_index]);
+
+        let areas = self.get_split_areas(
+            face.clone(),
+            connection_edges,
+            longest_edge_projection,
+            bounded_candidate,
+        );
+        let original_area = Self::get_face_area(
+            &face
+                .iter()
+                .map(|i| self.boundary_verts[*i])
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            (areas[0] + areas[1] - original_area).abs() < 0.05,
+            "Failure on split, difference: {} | {:?}",
+            (areas[0] + areas[1] - original_area).abs(),
+            self.split_face(
+                face.clone(),
+                connection_edges,
+                longest_edge_projection,
+                bounded_candidate
+            )
+            .map(|face| face.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>())
+        );
+
+        let ratio = areas[0].min(areas[1]) / areas[0].max(areas[1]);
+        let weight = lerp(
+            edge_ratio,
+            perpendicular,
+            self.network_parameters.prioritize_orthogonality_weight,
+        ) * ratio;
+
+        if weight.is_nan() {
+            println!(
+                "NaN weight: edge_ratio: {edge_ratio}, perp: {perpendicular}, v0: {:?}, v1: {:?}",
+                (v0.x, v0.y),
+                (v1.x, v1.y)
+            );
+        }
+
+        ((bounded_candidate, edge_index), weight)
+    }
+
     fn get_best_connection_points(
         &self,
         low_oxygen_point: Vector3<f32>,
@@ -235,45 +316,19 @@ impl NetworkGenerationComponent {
         let connection_candidate_weights: Vec<((Vector3<f32>, usize), f32)> =
             projection_of_central_point_on_edges
                 .into_iter()
-                .map(|(vert, edge_index)| {
-                    let v0 = face_edges[edge_index][0];
-                    let v1 = face_edges[edge_index][1];
-                    let edge_ratio = (1.0
-                        - ((v0 - vert).norm() - (v1 - vert).norm()).abs() / (v1 - v0).norm())
-                        * lerp(1.0, (v1 - v0).norm(), self.network_parameters.prioritize_edge_length_weight);
-
-                    let perpendicular = 1.0
-                        - (vert - longest_edge_projection)
-                            .normalize()
-                            .dot(&(longest_edge[1] - longest_edge[0]).normalize())
-                            .abs();
-
-                    let connection_edges = [longest_edge_index, edge_index].map(|edge_index| face_edges_indices[edge_index]);
-
-                    let areas = self.get_split_areas(face.clone(), connection_edges, longest_edge_projection, vert);
-                    let original_area = Self::get_face_area(&face.iter().map(|i| self.boundary_verts[*i]).collect::<Vec<_>>());
-                    assert!(
-                        (areas[0] + areas[1] - original_area).abs() < 0.05,
-                        "Failure on split, difference: {} | {:?}",
-                        (areas[0] + areas[1] - original_area).abs(),
-                        self.split_face(face.clone(), connection_edges, longest_edge_projection, vert)
-                            .map(|face| face.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>())
-                    );
-
-                    let ratio = areas[0].min(areas[1]) / areas[0].max(areas[1]);
-                    let weight = lerp(edge_ratio, perpendicular, self.network_parameters.prioritize_orthogonality_weight) * ratio;
-
-                    print!("polygon({:?}, {:?}): ratio: {ratio}, weight: {weight} | ", (longest_edge_projection.x, longest_edge_projection.y), (vert.x, vert.y));
-
-                    if weight.is_nan() {
-                        println!("NaN weight: edge_ratio: {edge_ratio}, perp: {perpendicular}, v0: {:?}, v1: {:?}", (v0.x, v0.y), (v1.x, v1.y));
-                    }
-
-                    ((vert, edge_index), weight)
+                .map(|(projected_candidate, edge_index)| {
+                    self.calculate_connection_candidate_weight(
+                        projected_candidate,
+                        edge_index,
+                        face.clone(),
+                        face_edges,
+                        face_edges_indices,
+                        longest_edge_projection,
+                        longest_edge,
+                        longest_edge_index,
+                    )
                 })
                 .collect();
-
-        println!();
 
         let other_connection = connection_candidate_weights
             .into_iter()
@@ -319,27 +374,17 @@ impl NetworkGenerationComponent {
         }
     }
 
-    /* fn print_adjacency_list(&self) {
-        for (vert, list) in &self.boundary_adjacency_list {
-            println!(
-                "L({}, {:?})",
-                vert + 1,
-                list.iter().map(|v| *v + 1).collect::<Vec<_>>()
-            );
-        }
-    } */
-
     fn update_adjacency_list(
         &mut self,
         low_oxygen_point: Vector3<f32>,
         connection_points: [(Vector3<f32>, usize); 2],
         edges_indices: &[[usize; 2]],
     ) {
-        println!(
+        /* println!(
             "edge: {:?}, edge indices: {:?}",
             connection_points.map(|(p, _)| (p.x, p.y)),
             connection_points.map(|(_, i)| edges_indices[i])
-        );
+        ); */
         let merged_connection_points = connection_points.map(|(connection_vertex, _)| {
             if let Some(existing_connection) = (0..self.boundary_verts.len())
                 .filter(|&i| (self.boundary_verts[i] - connection_vertex).norm_squared() < 0.0001)
@@ -351,8 +396,6 @@ impl NetworkGenerationComponent {
                 self.boundary_verts.len() - 1
             }
         });
-
-        // self.boundary_verts.push(low_oxygen_point);
 
         let edges = [merged_connection_points]; //merged_connection_points.map(|p| [p, self.boundary_verts.len() - 1]);
 
@@ -451,10 +494,7 @@ impl ComponentSystem for NetworkGenerationComponent {
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
         }
-        if self.current_iter == 50 {
-            println!("x");
-        }
-        println!("----------------------------------");
+        /* println!("----------------------------------");
         for face in self.dcel.faces() {
             print!(
                 "polygon({:?})",
@@ -466,7 +506,7 @@ impl ComponentSystem for NetworkGenerationComponent {
                     .collect::<Vec<_>>()
             );
         }
-        println!();
+        println!(); */
         let face_areas = self
             .dcel
             .faces()
