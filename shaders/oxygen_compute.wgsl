@@ -31,11 +31,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let proj = clamp(dot(offset_pos, vessel_dir) / dot(vessel_dir, vessel_dir) * vessel_dir + vessel.p1, low_bound, high_bound);
         let cutoff = 0.08;
         let dist = max(cutoff - distance(pos, proj) / 512.0, 0.0) / cutoff * normalize(pos - proj);
-        let highval = 1000000.0;
-        res += dist;
-        if min(vessel.p1.x, highval) == highval {
-            res = vec2f(1.0, 0.0);// vec2f(distance(vec2f(id.xy), vessel_edges[0].p1)) / 512.0;
-            break;
+        if (any((pos - proj) != vec2f(0.0))) {
+            let highval = 1000000.0;
+            res += dist;
+            if min(vessel.p1.x, highval) == highval {
+                res = vec2f(50.0, 50.0);// vec2f(distance(vec2f(id.xy), vessel_edges[0].p1)) / 512.0;
+                break;
+            }
         }
         /* let prev = textureLoad(oxygen_concentration, id.xy);
         textureStore(oxygen_concentration, id.xy, prev + vec4f(dist, 0.0, 0.0)); */

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use cool_utils::data_structures::dcel::DCEL;
 use egui::Context;
 use nalgebra::Vector3;
 use v4::{
@@ -28,8 +27,9 @@ pub struct NetworkDetails {
 pub struct NetworkGenerationComponent {
     boundary_verts: Vec<Vector3<f32>>,
     boundary_adjacency_list: HashMap<usize, HashSet<usize>>,
-    #[default]
-    dcel: DCEL,
+    /* #[default]
+    dcel: DCEL, */
+    faces: Vec<Vec<usize>>,
     max_iter_count: usize,
     #[default(0)]
     current_iter: usize,
@@ -66,6 +66,7 @@ impl NetworkGenerationComponent {
                     .cross(&Vector3::new(0.0, 0.0, -1.0))
                     .normalize();
                 if normal.x.is_nan() {
+                    // println!("Face: {:?}", face/* .iter().map(|&v| {let p = self.boundary_verts[v]; (p.x, p.y)}).collect::<Vec<_>>() */);
                     println!(
                         "Nan normalizing: from {:?} to {:?}",
                         (edge[0].x, edge[0].y),
@@ -89,11 +90,21 @@ impl NetworkGenerationComponent {
     }
 
     pub fn split_face_with_edge(
+        &self,
         mut face: Vec<usize>,
         connection_edges: [[usize; 2]; 2],
     ) -> ([Vec<usize>; 2], [usize; 2]) {
-        let indices_of_connection_edges_within_face = connection_edges
-            .map(|edge| edge.map(|vert_idx| face.iter().position(|&i| i == vert_idx).unwrap()));
+        let indices_of_connection_edges_within_face = connection_edges.map(|edge| {
+            edge.map(|vert_idx| {
+                face.iter().position(|&i| i == vert_idx).unwrap() /* .expect(&format!(
+                "Failed to find vertex {vert_idx} in face {face:?}, face: {:?}, vert: {:?}, edge: {edge:?}, neighbors: {:?}, neighbors of neighbors: {:?}",
+                face.iter().map(|&v| (self.boundary_verts[v].x, self.boundary_verts[v].y)).collect::<Vec<_>>(),
+                (self.boundary_verts[vert_idx].x, self.boundary_verts[vert_idx].y),
+                self.boundary_adjacency_list[&vert_idx],
+                self.boundary_adjacency_list[&vert_idx].iter().map(|neighbor| (neighbor, self.boundary_adjacency_list[neighbor].clone())).collect::<Vec<_>>(),
+                )) */
+            })
+        });
 
         let indices_for_connection_insertions =
             indices_of_connection_edges_within_face.map(|[i0, i1]| {
@@ -149,7 +160,7 @@ impl NetworkGenerationComponent {
         longest_edge_proj: Vector3<f32>,
         candidate_vert: Vector3<f32>,
     ) -> [Vec<Vector3<f32>>; 2] {
-        let (splits, [first_val_replace, second_val_replace]) = Self::split_face_with_edge(
+        let (splits, [first_val_replace, second_val_replace]) = self.split_face_with_edge(
             face,
             connection_edges.map(|[i0, i1]| [i0.min(i1), i0.max(i1)]),
         );
@@ -170,15 +181,8 @@ impl NetworkGenerationComponent {
         })
     }
 
-    fn get_split_areas(
-        &self,
-        face: Vec<usize>,
-        connection_edges: [[usize; 2]; 2],
-        longest_edge_proj: Vector3<f32>,
-        candidate_vert: Vector3<f32>,
-    ) -> [f32; 2] {
-        self.split_face(face, connection_edges, longest_edge_proj, candidate_vert)
-            .map(|split| Self::get_face_area(&split))
+    fn get_split_areas(&self, faces: [Vec<Vector3<f32>>; 2]) -> [f32; 2] {
+        faces.map(|split| Self::get_face_area(&split))
     }
 
     fn calculate_connection_candidate_weight(
@@ -219,12 +223,16 @@ impl NetworkGenerationComponent {
         let connection_edges =
             [longest_edge_index, edge_index].map(|edge_index| face_edges_indices[edge_index]);
 
-        let areas = self.get_split_areas(
+        /* println!("Connection edges: {connection_edges:?}");
+        println!("Face indices: {face:?}"); */
+
+        let face_split = self.split_face(
             face.clone(),
             connection_edges,
             longest_edge_projection,
             bounded_candidate,
         );
+        let areas = self.get_split_areas(face_split.clone());
         let original_area = Self::get_face_area(
             &face
                 .iter()
@@ -235,13 +243,7 @@ impl NetworkGenerationComponent {
             (areas[0] + areas[1] - original_area).abs() < 0.05,
             "Failure on split, difference: {} | {:?}",
             (areas[0] + areas[1] - original_area).abs(),
-            self.split_face(
-                face.clone(),
-                connection_edges,
-                longest_edge_projection,
-                bounded_candidate
-            )
-            .map(|face| face.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>())
+            face_split.map(|face| face.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>())
         );
 
         let ratio = areas[0].min(areas[1]) / areas[0].max(areas[1]);
@@ -268,7 +270,7 @@ impl NetworkGenerationComponent {
         face_edges: &[[Vector3<f32>; 2]],
         face_edges_indices: &[[usize; 2]],
         face: Vec<usize>,
-    ) -> [(Vector3<f32>, usize); 2] {
+    ) -> ([(Vector3<f32>, usize); 2], ([Vec<usize>; 2], [usize; 2])) {
         let (longest_edge_index, longest_edge) = face_edges
             .iter()
             .enumerate()
@@ -311,7 +313,6 @@ impl NetworkGenerationComponent {
                 }
             })
             .collect();
-        println!();
 
         let connection_candidate_weights: Vec<((Vector3<f32>, usize), f32)> =
             projection_of_central_point_on_edges
@@ -336,10 +337,21 @@ impl NetworkGenerationComponent {
             .unwrap()
             .0;
 
-        [
-            (longest_edge_projection, longest_edge_index),
-            other_connection,
-        ]
+        let face_split = self.split_face_with_edge(
+            face.clone(),
+            [longest_edge_index, other_connection.1].map(|edge_index| {
+                let [i0, i1] = face_edges_indices[edge_index];
+                [i0.min(i1), i0.max(i1)]
+            }),
+        );
+
+        (
+            [
+                (longest_edge_projection, longest_edge_index),
+                other_connection,
+            ],
+            face_split,
+        )
     }
 
     fn insert_edge_into_adjacency_list(
@@ -379,7 +391,7 @@ impl NetworkGenerationComponent {
         low_oxygen_point: Vector3<f32>,
         connection_points: [(Vector3<f32>, usize); 2],
         edges_indices: &[[usize; 2]],
-    ) {
+    ) -> [usize; 2] {
         /* println!(
             "edge: {:?}, edge indices: {:?}",
             connection_points.map(|(p, _)| (p.x, p.y)),
@@ -405,9 +417,10 @@ impl NetworkGenerationComponent {
                 connection_points.map(|(_, edge_index)| edges_indices[edge_index]),
             );
         }
+        merged_connection_points
     }
 
-    fn recalculate_dcel(&mut self) {
+    /* fn recalculate_dcel(&mut self) {
         self.dcel = DCEL::new(
             &self
                 .boundary_verts
@@ -416,7 +429,7 @@ impl NetworkGenerationComponent {
                 .collect::<Vec<_>>(),
             &self.boundary_adjacency_list,
         );
-    }
+    } */
 
     fn update_buffers(
         new_edge: [Vector3<f32>; 2],
@@ -472,7 +485,7 @@ impl NetworkGenerationComponent {
 
 impl ComponentSystem for NetworkGenerationComponent {
     fn initialize(&mut self, _device: &Device) -> ActionQueue {
-        self.recalculate_dcel();
+        // self.recalculate_dcel();
 
         self.set_initialized();
         vec![Box::new(RegisterUiComponentAction {
@@ -495,9 +508,9 @@ impl ComponentSystem for NetworkGenerationComponent {
             return Vec::new();
         }
         /* println!("----------------------------------");
-        for face in self.dcel.faces() {
+        for face in &self.faces {
             print!(
-                "polygon({:?})",
+                "polygon({:?}),",
                 face.iter()
                     .map(|&face_idx| (
                         self.boundary_verts[face_idx].x,
@@ -508,22 +521,16 @@ impl ComponentSystem for NetworkGenerationComponent {
         }
         println!(); */
         let face_areas = self
-            .dcel
-            .faces()
+            .faces
             .iter()
             .enumerate()
             .map(|(i, face)| {
-                let area = face
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &vert_index)| {
-                        let point_indices = [vert_index, face[(i + 1) % face.len()]];
-                        let vectors = point_indices.map(|i| self.boundary_verts[i]);
-                        vectors[0].cross(&vectors[1])
-                    })
-                    .sum::<Vector3<f32>>()
-                    .norm()
-                    / 2.0;
+                let area = Self::get_face_area(
+                    &face
+                        .iter()
+                        .map(|&v| self.boundary_verts[v])
+                        .collect::<Vec<_>>(),
+                );
                 (i, area)
             })
             .collect::<Vec<_>>();
@@ -533,18 +540,24 @@ impl ComponentSystem for NetworkGenerationComponent {
             .unwrap()
             .0;
 
-        let face = &self.dcel.faces()[face_index];
-        let filtered_edges_indices: Vec<[usize; 2]> = self
-            .dcel
-            .edges_of_face(face_index)
-            .iter()
-            .filter(|edge| {
-                !self
+        let face = &self.faces[face_index];
+        let filtered_edges_indices: Vec<[usize; 2]> = (0..face.len())
+            .flat_map(|i| {
+                let edge = [face[i], face[(i + 1) % face.len()]];
+                if self
                     .non_edges
                     .contains(&[edge[0].min(edge[1]), edge[0].max(edge[1])])
+                {
+                    None
+                } else {
+                    Some(edge)
+                }
             })
-            .copied()
             .collect();
+
+        /* println!("Face: {:?}", self.dcel.faces()[face_index]);
+        println!("Full edges: {:?}", self.dcel.edges_of_face(face_index));
+        println!("Filtered edges: {filtered_edges_indices:?}"); */
 
         let filtered_edges: Vec<[Vector3<f32>; 2]> = filtered_edges_indices
             .iter()
@@ -556,18 +569,42 @@ impl ComponentSystem for NetworkGenerationComponent {
             .sum::<Vector3<f32>>()
             / face.len() as f32;
 
-        let connection_points = self.get_best_connection_points(
-            central_lowest_oxygen_point,
-            &filtered_edges,
-            &filtered_edges_indices,
-            face.clone(),
-        );
+        let (connection_points, (mut new_faces, [first_index_replace, second_index_replace])) =
+            self.get_best_connection_points(
+                central_lowest_oxygen_point,
+                &filtered_edges,
+                &filtered_edges_indices,
+                face.clone(),
+            );
 
-        self.update_adjacency_list(
+        let [first_connection_index, second_connection_index] = self.update_adjacency_list(
             central_lowest_oxygen_point,
             connection_points,
             &filtered_edges_indices,
         );
+
+        new_faces = new_faces.map(|face| {
+            face.iter()
+                .enumerate()
+                .flat_map(|(i, &vert_index)| {
+                    let new_index = if vert_index == first_index_replace {
+                        first_connection_index
+                    } else if vert_index == second_index_replace {
+                        second_connection_index
+                    } else {
+                        vert_index
+                    };
+
+                    if face[(i as i32 - 1).rem_euclid(face.len() as i32) as usize] == new_index
+                        || face[(i + 1) % face.len()] == new_index
+                    {
+                        None
+                    } else {
+                        Some(new_index)
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
 
         let new_edge = connection_points.map(|(p, _)| p);
 
@@ -593,7 +630,11 @@ impl ComponentSystem for NetworkGenerationComponent {
         }
 
         self.current_iter += 1;
-        self.recalculate_dcel();
+
+        self.faces.remove(face_index);
+        for face in new_faces {
+            self.faces.push(face);
+        }
 
         Vec::new()
     }
@@ -620,7 +661,7 @@ impl ComponentSystem for NetworkGenerationComponent {
                         let (_, boundary, boundary_adjacency_list) = initialize_points();
                         self.boundary_verts = boundary;
                         self.boundary_adjacency_list = boundary_adjacency_list;
-                        self.recalculate_dcel();
+                        self.faces = vec![vec![0, 1, 2, 3]];
                     }
 
                     edge_length_slider.labelled_by(edge_length_weight_label.id);
@@ -646,6 +687,7 @@ mod test {
 
     fn mock_comp(verts: Vec<Vector3<f32>>) -> NetworkGenerationComponent {
         NetworkGenerationComponent::builder()
+            .faces(vec![(0..verts.len()).collect()])
             .boundary_verts(verts)
             .boundary_adjacency_list(Default::default())
             .display_vessel_edges_compute(0)
@@ -658,27 +700,27 @@ mod test {
 
     #[test]
     fn test_basic_face_split() {
+        let comp = mock_comp(Vec::new());
         let ([first_split, second_split], _) =
-            NetworkGenerationComponent::split_face_with_edge(vec![0, 1, 2, 3], [[0, 1], [1, 2]]);
+            comp.split_face_with_edge(vec![0, 1, 2, 3], [[0, 1], [1, 2]]);
         assert_eq!(first_split, vec![0, usize::MAX - 1, usize::MAX, 2, 3]);
         assert_eq!(second_split, vec![usize::MAX - 1, 1, usize::MAX]);
     }
 
     #[test]
     fn test_basic_face_split_orthogonal() {
+        let comp = mock_comp(Vec::new());
         let ([first_split, second_split], _) =
-            NetworkGenerationComponent::split_face_with_edge(vec![0, 1, 2, 3], [[0, 1], [2, 3]]);
+            comp.split_face_with_edge(vec![0, 1, 2, 3], [[0, 1], [2, 3]]);
         assert_eq!(first_split, vec![0, usize::MAX - 1, usize::MAX, 3]);
         assert_eq!(second_split, vec![usize::MAX - 1, 1, 2, usize::MAX]);
     }
 
     #[test]
     fn test_basic_face_split_on_array_edge() {
+        let comp = mock_comp(Vec::new());
         let ([first_split, second_split], [first_replace, second_replace]) =
-            NetworkGenerationComponent::split_face_with_edge(
-                vec![10, 11, 12, 13],
-                [[11, 12], [10, 13]],
-            );
+            comp.split_face_with_edge(vec![10, 11, 12, 13], [[11, 12], [10, 13]]);
         assert_eq!(first_split, vec![usize::MAX - 1, usize::MAX, 12, 13]);
         assert_eq!(second_split, vec![usize::MAX - 1, 10, 11, usize::MAX]);
         assert_eq!(first_replace, usize::MAX);
@@ -708,12 +750,14 @@ mod test {
         ];
         let comp = mock_comp(verts.clone());
 
-        let areas = comp.get_split_areas(
+        let face_split = comp.split_face(
             vec![0, 1, 2, 3],
             [[0, 1], [2, 3]],
             Vector3::new(0.5, 0.0, 0.0),
             Vector3::new(0.5, 1.0, 0.0),
         );
+
+        let areas = comp.get_split_areas(face_split);
         assert_eq!(
             areas[0] + areas[1],
             NetworkGenerationComponent::get_face_area(&verts)
@@ -732,12 +776,14 @@ mod test {
         ];
         let comp = mock_comp(verts.clone());
 
-        let areas = comp.get_split_areas(
+        let face_split = comp.split_face(
             vec![0, 1, 2, 3],
             [[0, 1], [0, 3]],
             Vector3::new(0.5, 0.0, 0.0),
             Vector3::new(0.0, 0.5, 0.0),
         );
+
+        let areas = comp.get_split_areas(face_split);
         assert_eq!(
             areas[0] + areas[1],
             NetworkGenerationComponent::get_face_area(&verts)

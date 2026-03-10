@@ -115,6 +115,7 @@ async fn main() {
                 ),
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
+                    faces: vec![vec![0, 1, 2, 3]],
                     boundary_adjacency_list: boundary_adjacency_list,
                     max_iter_count: 100,
                     network_parameters: NetworkDetails {
