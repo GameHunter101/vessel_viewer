@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+const BUFFER_SIZE: usize = 256;
+const AREA_SIZE: usize = 512;
 
 use image::EncodableLayout;
 use nalgebra::Vector3;
@@ -32,23 +33,23 @@ async fn main() {
     let device = rendering_manager.device();
     let queue = rendering_manager.queue();
 
-    let (vessels, boundary, boundary_adjacency_list) = initialize_points();
+    let (vessels, boundary) = initialize_points();
 
     let oxygen_compute_edges: Vec<ComputeEdge> = vessels
         .chunks(2)
         .map(|points| {
             ComputeEdge::new(
                 [
-                    (points[0].pos[0] + 1.0) * 256.0,
-                    (points[0].pos[1] + 1.0) * 256.0,
+                    (points[0].pos[0] + 1.0) * (AREA_SIZE / 2) as f32,
+                    (points[0].pos[1] + 1.0) * (AREA_SIZE / 2) as f32,
                 ],
                 [
-                    (points[1].pos[0] + 1.0) * 256.0,
-                    (points[1].pos[1] + 1.0) * 256.0,
+                    (points[1].pos[0] + 1.0) * (AREA_SIZE / 2) as f32,
+                    (points[1].pos[1] + 1.0) * (AREA_SIZE / 2) as f32,
                 ],
             )
         })
-        .chain([ComputeEdge::default(); 126])
+        .chain([ComputeEdge::default(); BUFFER_SIZE - 2])
         .collect();
 
     let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0, 0.0, 0.0, 1.0]));
@@ -115,15 +116,11 @@ async fn main() {
                 ),
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
-                    faces: vec![vec![0, 1, 2, 3]],
-                    boundary_adjacency_list: boundary_adjacency_list,
-                    max_iter_count: 100,
+                    edges: vec![[0, 1], [2, 3]],
+                    max_iter_count: 1,
                     network_parameters: NetworkDetails {
-                        prioritize_edge_length_weight: 0.1,
-                        prioritize_orthogonality_weight: 0.0,
-                        branch_dilation_factor: 1.0,
+                        edge_lerp_distance_to_length_factor: 0.0,
                     },
-                    non_edges: HashSet::from([[0, 3], [1, 2]]),
                     vessel_edges_component: ident("vessel_edges"),
                     display_vessel_edges_compute: ident("vessel_compute"),
                 )
@@ -234,7 +231,7 @@ impl VertexDescriptor for DisplayVertex {
     }
 }
 
-pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>, HashMap<usize, HashSet<usize>>) {
+pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>) {
     let vessels = vec![
         Vertex {
             pos: [-1.0, -0.85, 0.0],
@@ -256,20 +253,8 @@ pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>, HashMap<usize, Ha
 
     let boundary: Vec<Vector3<f32>> = vessels
         .iter()
-        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * 256.0)
+        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * (AREA_SIZE as f32 / 2.0))
         .collect();
 
-    let boundary_adjacency_list: HashMap<usize, HashSet<usize>> = (0..boundary.len())
-        .map(|i| {
-            (
-                i,
-                HashSet::from_iter([
-                    (i as i32 - 1).rem_euclid(boundary.len() as i32) as usize,
-                    (i + 1) % boundary.len(),
-                ]),
-            )
-        })
-        .collect();
-
-    (vessels, boundary, boundary_adjacency_list)
+    (vessels, boundary)
 }
