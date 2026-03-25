@@ -117,9 +117,10 @@ async fn main() {
                 NetworkGenerationComponent(
                     boundary_verts: boundary,
                     edges: vec![[0, 1], [2, 3]],
-                    max_iter_count: 1,
+                    max_iter_count: 30,
                     network_parameters: NetworkDetails {
                         edge_lerp_distance_to_length_factor: 0.0,
+                        edge_lerp_concentration_to_edge_perpendicular: 0.0,
                     },
                     vessel_edges_component: ident("vessel_edges"),
                     display_vessel_edges_compute: ident("vessel_compute"),
