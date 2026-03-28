@@ -163,47 +163,76 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                     saturation_subdivisions,
                 );
 
-                if self
-                    .edge_intersects_any_edges([*current_sweep_point, fixed_point])
-                    .is_some()
-                {
-                    OrderedFloat(f32::MAX)
-                } else {
-                    OrderedFloat(lerp(
-                        edge_saturation,
-                        (current_sweep_point - sweep_edge[0])
-                            .normalize()
-                            .dot(&(current_sweep_point - fixed_point).normalize())
-                            .abs(),
-                        perpendicular_lerp_factor,
-                    ))
-                }
+                OrderedFloat(lerp(
+                    edge_saturation,
+                    (current_sweep_point - sweep_edge[0])
+                        .normalize()
+                        .dot(&(current_sweep_point - fixed_point).normalize())
+                        .abs(),
+                    perpendicular_lerp_factor,
+                ))
             })
             .unwrap()
     }
 
-    fn edge_intersects_any_edges(&self, new_edge: [Vector3<f32>; 2]) -> Option<Vector3<f32>> {
-        self.edges
+    fn edge_sdf(&self, edge: [usize; 2], point: Vector3<f32>) -> f32 {
+        let [a, b] = edge.map(|i| self.boundary_verts[i]);
+        let pa = point - a;
+        let ba = b - a;
+        let h = (pa.dot(&ba) / ba.dot(&ba)).clamp(0.0, 1.0);
+
+        (pa - ba * h).norm()
+    }
+
+    fn eval_sdf_field(&self, point: Vector3<f32>) -> (f32, usize) {
+        let (distance, edge_index) = self
+            .edges
             .iter()
-            .flat_map(|edge_indices| {
-                let edge = edge_indices.map(|i| self.boundary_verts[i]);
-                if let Some(intersection) = calc_intersection_point(new_edge, edge) {
-                    /* println!("Distances: {:?}",
-                    edge.iter()
-                        .chain(new_edge.iter())
-                        .map(|point| (point.metric_distance(&intersection), (point.x, point.y))).collect::<Vec<_>>()); */
-                    if edge.iter()
-                        .chain(new_edge.iter())
-                        .any(|point| point.metric_distance(&intersection) < 0.001) {
-                        None
-                    } else {
-                        Some(intersection)
-                    }
-                } else {
-                    None
-                }
-            })
-            .next()
+            .enumerate()
+            .map(|(i, edge)| (OrderedFloat(self.edge_sdf(*edge, point)), i))
+            .min_by_key(|(dist, _)| *dist)
+            .unwrap();
+
+        (distance.into_inner(), edge_index)
+    }
+
+    fn sdf_field_gradient(&self, point: Vector3<f32>, h: f32) -> Vector3<f32> {
+        let val_at_point = self.eval_sdf_field(point).0;
+        Vector3::from(
+            [
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+            ]
+            .map(|offset| self.eval_sdf_field(point + offset * h).0 - val_at_point),
+        ) / h
+    }
+
+    fn raycast_in_dir(
+        &self,
+        origin: Vector3<f32>,
+        dir: Vector3<f32>,
+        max_dist: f32,
+        max_iter_count: u32,
+        min_dist: f32,
+    ) -> (f32, usize) {
+        let mut pos = origin;
+        let mut closest_edge = self.eval_sdf_field(origin).1;
+        let mut distance = 0.0;
+        for _ in 0..max_iter_count {
+            if distance >= max_dist {
+                break;
+            }
+            let (next_distance, edge_index) = self.eval_sdf_field(pos);
+            pos += dir * next_distance;
+            closest_edge = edge_index;
+            distance += next_distance;
+            if next_distance < min_dist {
+                break;
+            }
+        }
+
+        (distance, closest_edge)
     }
 }
 
@@ -211,8 +240,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
     for NetworkGenerationComponent<T>
 {
     fn initialize(&mut self, _device: &Device) -> ActionQueue {
-        // self.recalculate_dcel();
-
         self.distribute_probes();
         println!(
             "{:?}",
@@ -249,7 +276,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                 )
             };
 
-        let target_oxygen_probe = self
+        let target_oxygen_probe = *self
             .probes
             .iter()
             .max_by_key(|&&position| {
@@ -264,21 +291,36 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             })
             .unwrap();
 
-        let first_target_edge_indices = self
+        let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
+
+        println!("Pos: {:?}, grad: {sdf_gradient}", (target_oxygen_probe.x, target_oxygen_probe.y));
+
+        let (_, first_edge_index) =
+            self.raycast_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01);
+        let (_, second_edge_index) =
+            self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
+
+        let first_edge = self.edges[first_edge_index].map(|i| self.boundary_verts[i]);
+        let second_edge = self.edges[second_edge_index].map(|i| self.boundary_verts[i]);
+
+        /* let first_projection = clamp_vector_on_edge(vector_project(
+            first_edge[1] - first_edge[0],
+            target_oxygen_probe - first_edge[0],
+        ) + first_edge[0], first_edge);
+
+        let second_projection = clamp_vector_on_edge(vector_project(
+            second_edge[1] - second_edge[0],
+            target_oxygen_probe - second_edge[0],
+        ) + second_edge[0], second_edge); */
+
+        // let new_edge = [first_projection, second_projection];
+
+        /* let first_target_edge_indices = self
             .edges
             .iter()
-            .filter(|edge_indices| {
-                let edge = edge_indices.map(|i| self.boundary_verts[i]);
-                let temp_intersection_edge = [
-                    vector_project(edge[1] - edge[0], *target_oxygen_probe - edge[0]) + edge[0],
-                    *target_oxygen_probe,
-                ];
-                self.edge_intersects_any_edges(temp_intersection_edge)
-                    .is_none()
-            })
             .min_by_key(|edge_vertex_indices| {
                 let distance =
-                    distance_to_edge(edge_vertex_indices, *target_oxygen_probe).into_inner();
+                    distance_to_edge(edge_vertex_indices, target_oxygen_probe).into_inner();
                 let edge = edge_vertex_indices.map(|i| self.boundary_verts[i]);
                 OrderedFloat(lerp(
                     distance,
@@ -295,18 +337,11 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             .iter()
             .filter(|edge_indices| {
                 let [v0, v1] = edge_indices;
-                let edge = edge_indices.map(|i| self.boundary_verts[i]);
-                let temp_intersection_edge = [
-                    vector_project(edge[1] - edge[0], *target_oxygen_probe - edge[0]) + edge[0],
-                    *target_oxygen_probe,
-                ];
-                self.edge_intersects_any_edges(temp_intersection_edge)
-                    .is_none()
-                    && (*v0 != first_target_edge_indices[0] || *v1 != first_target_edge_indices[1])
+                *v0 != first_target_edge_indices[0] || *v1 != first_target_edge_indices[1]
             })
             .min_by_key(|edge_vertex_indices| {
                 let distance =
-                    distance_to_edge(edge_vertex_indices, *target_oxygen_probe).into_inner();
+                    distance_to_edge(edge_vertex_indices, target_oxygen_probe).into_inner();
                 let edge = edge_vertex_indices.map(|i| self.boundary_verts[i]);
                 OrderedFloat(lerp(
                     distance,
@@ -316,14 +351,14 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             })
             .unwrap();
 
-        let second_target_edge = second_target_edge_indices.map(|i| self.boundary_verts[i]);
+        let second_target_edge = second_target_edge_indices.map(|i| self.boundary_verts[i]); */
 
         let sweep_subdivision = 5;
         let saturation_subdivision = NonZeroU32::new(10).unwrap();
         let first_sweep_result = self.sweep_single_endpoint_for_lowest_oxygen(
             sweep_subdivision,
-            second_target_edge[0],
-            first_target_edge,
+            second_edge[0],
+            first_edge,
             saturation_subdivision,
             0.0,
         );
@@ -331,13 +366,15 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         let second_sweep_result = self.sweep_single_endpoint_for_lowest_oxygen(
             sweep_subdivision,
             first_sweep_result,
-            second_target_edge,
+            second_edge,
             saturation_subdivision,
             self.network_parameters
                 .edge_lerp_concentration_to_edge_perpendicular,
         );
 
         let new_edge = [first_sweep_result, second_sweep_result];
+        println!("polygon({:?})", new_edge.map(|p| (p.x, p.y)));
+
         self.edges
             .push([self.boundary_verts.len(), self.boundary_verts.len() + 1]);
         self.boundary_verts.extend_from_slice(&new_edge);
@@ -426,26 +463,9 @@ fn lerp<T: std::ops::Add<Output = T> + std::ops::Mul<f32, Output = T>>(a: T, b: 
     a * (1.0 - t) + b * t
 }
 
-fn cross_2d(p_0: Vector3<f32>, p_1: Vector3<f32>) -> f32 {
-    p_0.x * p_1.y - p_0.y * p_1.x
-}
-
-pub fn calc_intersection_point(
-    edge_0: [Vector3<f32>; 2],
-    edge_1: [Vector3<f32>; 2],
-) -> Option<Vector3<f32>> {
-    let p = edge_0[0];
-    let q = edge_1[0];
-    let r = edge_0[1];
-    let s = edge_1[1];
-
-    let denominator = cross_2d(s - q, r - p);
-
-    let u = cross_2d(p - q, s - q) / denominator;
-    let t = cross_2d(p - q, r - p) / denominator;
-    if (u >= -0.0001 && u <= 1.0001) && (t >= -0.0001 && t <= 1.0001) {
-        Some(p + u * (r - p))
-    } else {
-        None
-    }
+fn clamp_vector_on_edge(vector: Vector3<f32>, edge: [Vector3<f32>; 2]) -> Vector3<f32> {
+    Vector3::from_iterator(
+        (0_usize..3)
+            .map(|i| vector[i].clamp(edge[0][i].min(edge[1][i]), edge[0][i].max(edge[1][i]))),
+    )
 }
