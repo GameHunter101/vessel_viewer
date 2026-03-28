@@ -3,6 +3,7 @@ const AREA_SIZE: usize = 512;
 
 use image::EncodableLayout;
 use nalgebra::Vector3;
+use rand::{SeedableRng, rngs::StdRng};
 use v4::{
     V4,
     builtin_components::mesh_component::{MeshComponent, VertexData, VertexDescriptor},
@@ -115,9 +116,10 @@ async fn main() {
                     enabled_models: vec![(0, None)]
                 ),
                 NetworkGenerationComponent(
+                    rng: StdRng::seed_from_u64(0),
                     boundary_verts: boundary,
                     edges: vec![[0, 1], [2, 3]],
-                    max_iter_count: 30,
+                    max_iter_count: 2,
                     network_parameters: NetworkDetails {
                         edge_lerp_distance_to_length_factor: 0.0,
                         edge_lerp_concentration_to_edge_perpendicular: 0.0,

@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 
 use egui::{Context, emath::OrderedFloat};
 use nalgebra::Vector3;
-use rand::{SeedableRng, seq::SliceRandom};
+use rand::{Rng, seq::SliceRandom};
 use v4::{
     builtin_actions::RegisterUiComponentAction,
     builtin_components::mesh_component::MeshComponent,
@@ -23,10 +23,13 @@ pub struct NetworkDetails {
     pub edge_lerp_concentration_to_edge_perpendicular: f32,
 }
 
-const PROBE_COUNT: usize = 50;
+const INIT_PROBE_COUNT: usize = 50;
 
 #[component]
-pub struct NetworkGenerationComponent {
+pub struct NetworkGenerationComponent<T> {
+    rng: T,
+    #[default(INIT_PROBE_COUNT)]
+    num_probes: usize,
     boundary_verts: Vec<Vector3<f32>>,
     edges: Vec<[usize; 2]>,
     max_iter_count: usize,
@@ -38,26 +41,21 @@ pub struct NetworkGenerationComponent {
     // non_edges: HashSet<[usize; 2]>,
     vessel_edges_component: ComponentId,
     display_vessel_edges_compute: ComponentId,
-    #[default([Vector3::zeros(); PROBE_COUNT])]
-    probes: [Vector3<f32>; PROBE_COUNT],
+    #[default(vec![Vector3::zeros(); INIT_PROBE_COUNT])]
+    probes: Vec<Vector3<f32>>,
 }
 
-impl NetworkGenerationComponent {
+impl<T: Rng> NetworkGenerationComponent<T> {
     /// Creates a low-discrepancy sequence using the N-rooks algorithm.
     /// https://blog.demofox.org/2017/05/29/when-random-numbers-are-too-random-low-discrepancy-sequences/
-    fn distribute_probes(&mut self, seed: Option<u64>) {
-        let mut values: Vec<u32> = (0..PROBE_COUNT as u32).collect::<Vec<_>>();
-        if let Some(seed) = seed {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            values.shuffle(&mut rng);
-        } else {
-            values.shuffle(&mut rand::rng());
-        };
+    fn distribute_probes(&mut self) {
+        let mut values: Vec<u32> = (0..self.num_probes as u32).collect::<Vec<_>>();
+        values.shuffle(&mut self.rng);
         let positions: Vec<Vector3<f32>> = values
             .into_iter()
             .enumerate()
             .map(|(i, val)| {
-                Vector3::new(i as f32, val as f32, 0.0) / PROBE_COUNT as f32 * AREA_SIZE as f32
+                Vector3::new(i as f32, val as f32, 0.0) / self.num_probes as f32 * AREA_SIZE as f32
             })
             .collect();
         self.probes = positions.try_into().unwrap();
@@ -99,7 +97,22 @@ impl NetworkGenerationComponent {
                 )
             })
             .collect();
-        visualization_buffer.update_buffer(bytemuck::cast_slice(&edges), device, queue);
+
+        let edge_count = edges.len();
+
+        visualization_buffer.update_buffer(
+            bytemuck::cast_slice(
+                &edges
+                    .into_iter()
+                    .chain(vec![
+                        ComputeEdge::default();
+                        crate::BUFFER_SIZE - edge_count
+                    ])
+                    .collect::<Vec<_>>(),
+            ),
+            device,
+            queue,
+        );
     }
 
     fn calc_saturation_at_point(&self, point: Vector3<f32>) -> f32 {
@@ -150,24 +163,57 @@ impl NetworkGenerationComponent {
                     saturation_subdivisions,
                 );
 
-                OrderedFloat(lerp(
-                    edge_saturation,
-                    (current_sweep_point - sweep_edge[0])
-                        .normalize()
-                        .dot(&(current_sweep_point - fixed_point).normalize())
-                        .abs(),
-                    perpendicular_lerp_factor,
-                ))
+                if self
+                    .edge_intersects_any_edges([*current_sweep_point, fixed_point])
+                    .is_some()
+                {
+                    OrderedFloat(f32::MAX)
+                } else {
+                    OrderedFloat(lerp(
+                        edge_saturation,
+                        (current_sweep_point - sweep_edge[0])
+                            .normalize()
+                            .dot(&(current_sweep_point - fixed_point).normalize())
+                            .abs(),
+                        perpendicular_lerp_factor,
+                    ))
+                }
             })
             .unwrap()
     }
+
+    fn edge_intersects_any_edges(&self, new_edge: [Vector3<f32>; 2]) -> Option<Vector3<f32>> {
+        self.edges
+            .iter()
+            .flat_map(|edge_indices| {
+                let edge = edge_indices.map(|i| self.boundary_verts[i]);
+                if let Some(intersection) = calc_intersection_point(new_edge, edge) {
+                    /* println!("Distances: {:?}",
+                    edge.iter()
+                        .chain(new_edge.iter())
+                        .map(|point| (point.metric_distance(&intersection), (point.x, point.y))).collect::<Vec<_>>()); */
+                    if edge.iter()
+                        .chain(new_edge.iter())
+                        .any(|point| point.metric_distance(&intersection) < 0.001) {
+                        None
+                    } else {
+                        Some(intersection)
+                    }
+                } else {
+                    None
+                }
+            })
+            .next()
+    }
 }
 
-impl ComponentSystem for NetworkGenerationComponent {
+impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
+    for NetworkGenerationComponent<T>
+{
     fn initialize(&mut self, _device: &Device) -> ActionQueue {
         // self.recalculate_dcel();
 
-        self.distribute_probes(None);
+        self.distribute_probes();
         println!(
             "{:?}",
             self.probes.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()
@@ -221,6 +267,15 @@ impl ComponentSystem for NetworkGenerationComponent {
         let first_target_edge_indices = self
             .edges
             .iter()
+            .filter(|edge_indices| {
+                let edge = edge_indices.map(|i| self.boundary_verts[i]);
+                let temp_intersection_edge = [
+                    vector_project(edge[1] - edge[0], *target_oxygen_probe - edge[0]) + edge[0],
+                    *target_oxygen_probe,
+                ];
+                self.edge_intersects_any_edges(temp_intersection_edge)
+                    .is_none()
+            })
             .min_by_key(|edge_vertex_indices| {
                 let distance =
                     distance_to_edge(edge_vertex_indices, *target_oxygen_probe).into_inner();
@@ -238,8 +293,16 @@ impl ComponentSystem for NetworkGenerationComponent {
         let second_target_edge_indices = self
             .edges
             .iter()
-            .filter(|[v0, v1]| {
-                *v0 != first_target_edge_indices[0] || *v1 != first_target_edge_indices[1]
+            .filter(|edge_indices| {
+                let [v0, v1] = edge_indices;
+                let edge = edge_indices.map(|i| self.boundary_verts[i]);
+                let temp_intersection_edge = [
+                    vector_project(edge[1] - edge[0], *target_oxygen_probe - edge[0]) + edge[0],
+                    *target_oxygen_probe,
+                ];
+                self.edge_intersects_any_edges(temp_intersection_edge)
+                    .is_none()
+                    && (*v0 != first_target_edge_indices[0] || *v1 != first_target_edge_indices[1])
             })
             .min_by_key(|edge_vertex_indices| {
                 let distance =
@@ -274,26 +337,7 @@ impl ComponentSystem for NetworkGenerationComponent {
                 .edge_lerp_concentration_to_edge_perpendicular,
         );
 
-        /* println!(
-            "First edge: polygon({:?})",
-            first_target_edge_indices.map(|i| (self.boundary_verts[i].x, self.boundary_verts[i].y))
-        );
-        println!(
-            "Second edge: polygon({:?})",
-            second_target_edge_indices
-                .map(|i| (self.boundary_verts[i].x, self.boundary_verts[i].y))
-        );
-        println!(
-            "Target: {:?}",
-            (target_oxygen_probe.x, target_oxygen_probe.y)
-        ); */
-
         let new_edge = [first_sweep_result, second_sweep_result];
-        /* println!("New edge: polygon({:?})", new_edge.map(|p| (p.x, p.y)));
-        println!(
-            "Oxygen on edge: {}",
-            self.calc_saturation_along_edge(new_edge, saturation_subdivision)
-        ); */
         self.edges
             .push([self.boundary_verts.len(), self.boundary_verts.len() + 1]);
         self.boundary_verts.extend_from_slice(&new_edge);
@@ -321,6 +365,10 @@ impl ComponentSystem for NetworkGenerationComponent {
 
         self.current_iter += 1;
 
+        self.num_probes += 1;
+
+        self.distribute_probes();
+
         Vec::new()
     }
 
@@ -345,8 +393,15 @@ impl ComponentSystem for NetworkGenerationComponent {
                         0.0..=1.0,
                     ));
 
+                    let iter_count = ui.add(
+                        egui::DragValue::new(&mut self.max_iter_count)
+                            .range(1..=100)
+                            .update_while_editing(true),
+                    );
+
                     if distance_to_length_factor_slider.changed()
                         || concentration_to_angle_factor_slider.changed()
+                        || iter_count.changed()
                     {
                         self.current_iter = 0;
                         let (_, boundary) = initialize_points();
@@ -369,4 +424,28 @@ fn vector_project(base: Vector3<f32>, target: Vector3<f32>) -> Vector3<f32> {
 
 fn lerp<T: std::ops::Add<Output = T> + std::ops::Mul<f32, Output = T>>(a: T, b: T, t: f32) -> T {
     a * (1.0 - t) + b * t
+}
+
+fn cross_2d(p_0: Vector3<f32>, p_1: Vector3<f32>) -> f32 {
+    p_0.x * p_1.y - p_0.y * p_1.x
+}
+
+pub fn calc_intersection_point(
+    edge_0: [Vector3<f32>; 2],
+    edge_1: [Vector3<f32>; 2],
+) -> Option<Vector3<f32>> {
+    let p = edge_0[0];
+    let q = edge_1[0];
+    let r = edge_0[1];
+    let s = edge_1[1];
+
+    let denominator = cross_2d(s - q, r - p);
+
+    let u = cross_2d(p - q, s - q) / denominator;
+    let t = cross_2d(p - q, r - p) / denominator;
+    if (u >= -0.0001 && u <= 1.0001) && (t >= -0.0001 && t <= 1.0001) {
+        Some(p + u * (r - p))
+    } else {
+        None
+    }
 }
