@@ -29,7 +29,7 @@ async fn main() {
                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
         )
         .window_attributes(WindowAttributes::default().with_surface_size(
-            winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(600, 600)),
+            winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(800, 800)),
         ))
         .build()
         .await;

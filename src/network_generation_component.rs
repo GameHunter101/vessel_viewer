@@ -4,12 +4,13 @@ use egui::{Context, emath::OrderedFloat};
 use nalgebra::Vector3;
 use rand::{Rng, seq::SliceRandom};
 use v4::{
+    EngineDetails,
     builtin_actions::RegisterUiComponentAction,
     builtin_components::mesh_component::MeshComponent,
     component,
     ecs::{
         actions::ActionQueue,
-        component::{ComponentDetails, ComponentId, ComponentSystem, UpdateParams},
+        component::{Component, ComponentDetails, ComponentId, ComponentSystem, UpdateParams},
         material::{ShaderAttachment, ShaderBufferAttachment},
     },
 };
@@ -232,9 +233,9 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             [
                 Vector3::new(1.0, 0.0, 0.0),
                 Vector3::new(0.0, 1.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
+                Vector3::new(0.0, 0.0, 0.0),
             ]
-            .map(|offset| self.eval_sdf_field(point + offset * h).0 - val_at_point),
+            .map(|offset| val_at_point - self.eval_sdf_field(point + offset * h).0),
         )
         .normalize()
     }
@@ -265,6 +266,41 @@ impl<T: Rng> NetworkGenerationComponent<T> {
 
         (distance, closest_edge, pos)
     }
+
+    fn show_gizmo(
+        &self,
+        other_components: &mut [&mut Component],
+        engine_details: &EngineDetails,
+        device: &Device,
+        queue: &Queue,
+    ) {
+        if let Some(component) = other_components
+            .iter_mut()
+            .filter(|comp| comp.id() == self.vessel_edges_component)
+            .next()
+        {
+            let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
+            let raw_cursor_pos = engine_details.cursor_position;
+            let cursor_pos = Vector3::new(
+                raw_cursor_pos.0 as f32 / engine_details.window_resolution.0 as f32,
+                (engine_details.window_resolution.1 - raw_cursor_pos.1) as f32
+                    / engine_details.window_resolution.1 as f32,
+                0.0,
+            ) * AREA_SIZE as f32;
+            let gradient = self.sdf_field_gradient(cursor_pos, 0.1);
+            let strength = self.eval_sdf_field(cursor_pos).0;
+            let end_pos = cursor_pos + gradient * strength;
+            Self::update_gizmo(
+                [cursor_pos, end_pos].map(|position| Vertex {
+                    pos: (position / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
+                    color: [1.0, 1.0, 0.0, 1.0],
+                }),
+                mesh_component,
+                device,
+                queue,
+            );
+        }
+    }
 }
 
 impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
@@ -294,35 +330,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             ..
         }: UpdateParams<'_, '_>,
     ) -> ActionQueue {
-        if let Some(component) = other_components
-            .iter_mut()
-            .filter(|comp| comp.id() == self.vessel_edges_component)
-            .next()
-        {
-            let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
-            let raw_cursor_pos = engine_details.cursor_position;
-            let cursor_pos = Vector3::new(
-                raw_cursor_pos.0 as f32,
-                (engine_details.window_resolution.1 - raw_cursor_pos.1) as f32,
-                0.0,
-            );
-            let gradient = self.sdf_field_gradient(cursor_pos, 0.1);
-            let end_pos = cursor_pos + gradient * self.eval_sdf_field(cursor_pos).0;
-            Self::update_gizmo(
-                [cursor_pos, end_pos].map(|position| Vertex {
-                    pos: (Vector3::new(
-                        position.x / (engine_details.window_resolution.0 as f32 / 2.0),
-                        position.y / (engine_details.window_resolution.1 as f32 / 2.0),
-                        position.z,
-                    ) - Vector3::new(1.0, 1.0, 0.0))
-                    .into(),
-                    color: [1.0, 1.0, 0.0, 1.0],
-                }),
-                mesh_component,
-                device,
-                queue,
-            );
-        }
+        self.show_gizmo(other_components, engine_details, device, queue);
 
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
@@ -354,29 +362,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             .unwrap();
 
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
-
-        // println!("Pos: {:?}, grad: {sdf_gradient}", (target_oxygen_probe.x, target_oxygen_probe.y));
-        /* println!("-----------------------");
-        for edge in &self.edges {
-            println!(
-                "polygon({:?})",
-                edge.map(|i| {
-                    let p = self.boundary_verts[i];
-                    (p.x, p.y)
-                })
-            );
-        }
-
-        println!("?????????");
-
-        for probe in &self.probes {
-            let grad = self.sdf_field_gradient(*probe, 0.01);
-            let other_point = probe - grad * self.eval_sdf_field(*probe).0;
-            println!(
-                "polygon({:?})",
-                [(probe.x, probe.y), (other_point.x, other_point.y)]
-            );
-        } */
 
         let (_, first_edge_index, first_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01);
@@ -456,10 +441,8 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         ); */
 
         // let new_edge = [first_sweep_result, second_sweep_result];
-        if (first_raycast_pos.x > AREA_SIZE as f32 || first_raycast_pos.x < 0.0/* || first_raycast_pos.y > AREA_SIZE as f32
-        || first_raycast_pos.y < 0.0 */)
-            || (second_raycast_pos.x > AREA_SIZE as f32 || second_raycast_pos.x < 0.0/* || second_raycast_pos.y > AREA_SIZE as f32
-            || second_raycast_pos.y < 0.0 */)
+        if (first_raycast_pos.x > AREA_SIZE as f32 || first_raycast_pos.x < 0.0)
+            || (second_raycast_pos.x > AREA_SIZE as f32 || second_raycast_pos.x < 0.0)
         {
             self.distribute_probes();
             return Vec::new();
@@ -544,7 +527,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 
                     let iter_count = ui.add(
                         egui::DragValue::new(&mut self.max_iter_count)
-                            .range(1..=100)
+                            .range(0..=100)
                             .update_while_editing(true),
                     );
 
@@ -581,4 +564,86 @@ fn clamp_vector_on_edge(vector: Vector3<f32>, edge: [Vector3<f32>; 2]) -> Vector
         (0_usize..3)
             .map(|i| vector[i].clamp(edge[0][i].min(edge[1][i]), edge[0][i].max(edge[1][i]))),
     )
+}
+
+#[cfg(test)]
+mod test {
+    use nalgebra::Vector3;
+    use rand::rng;
+
+    use crate::{AREA_SIZE, network_generation_component::NetworkGenerationComponent};
+
+    fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
+        p1.metric_distance(&p2) < 0.001
+    }
+
+    #[test]
+    fn sdf_test_single_edge() {
+        let network = NetworkGenerationComponent::builder()
+            .rng(rng())
+            .boundary_verts(
+                [[-1.0, -0.85], [1.0, -0.85]]
+                    .map(|p| {
+                        (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
+                            * AREA_SIZE as f32
+                            / 2.0
+                    })
+                    .to_vec(),
+            )
+            .edges(vec![[0, 1]])
+            .network_parameters(crate::network_generation_component::NetworkDetails {
+                edge_lerp_distance_to_length_factor: 0.0,
+                edge_lerp_concentration_to_edge_perpendicular: 0.0,
+            })
+            .vessel_edges_component(0)
+            .display_vessel_edges_compute(0)
+            .max_iter_count(0)
+            .build();
+
+        let test_point = Vector3::new(89.0, 426.0, 0.0);
+
+        let (experimental, edge) = network.eval_sdf_field(test_point);
+        let real = 387.6;
+        assert!(
+            (experimental - real).abs() < 0.001,
+            "Expected sdf value {experimental} to equal {real}"
+        );
+        assert_eq!(edge, 0);
+        let gradient = network.sdf_field_gradient(test_point, 0.01);
+        assert!(points_are_close(gradient, Vector3::new(0.0, -1.0, 0.0)));
+    }
+
+    #[test]
+    fn sdf_test_two_edges() {
+        let network = NetworkGenerationComponent::builder()
+            .rng(rng())
+            .boundary_verts(
+                [[-1.0, -0.85], [1.0, -0.85], [1.0, 0.85], [-1.0, 0.85]]
+                    .map(|p| {
+                        (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
+                            * AREA_SIZE as f32
+                            / 2.0
+                    })
+                    .to_vec(),
+            )
+            .edges(vec![[0, 1], [2, 3]])
+            .network_parameters(crate::network_generation_component::NetworkDetails {
+                edge_lerp_distance_to_length_factor: 0.0,
+                edge_lerp_concentration_to_edge_perpendicular: 0.0,
+            })
+            .vessel_edges_component(0)
+            .display_vessel_edges_compute(0)
+            .max_iter_count(0)
+            .build();
+        let test_point = Vector3::new(89.0, 426.0, 0.0);
+        let (experimental, edge) = network.eval_sdf_field(test_point);
+        let real = 47.6;
+        assert!(
+            (experimental - real).abs() < 0.001,
+            "Expected sdf value {experimental} to equal {real}"
+        );
+        assert_eq!(edge, 1);
+        let gradient = network.sdf_field_gradient(test_point, 0.01);
+        assert!(points_are_close(gradient, Vector3::new(0.0, 1.0, 0.0)));
+    }
 }
