@@ -15,8 +15,9 @@ use v4::{
     scene,
 };
 use wgpu::vertex_attr_array;
+use winit::window::WindowAttributes;
 
-use crate::network_generation_component::{NetworkGenerationComponent, NetworkDetails};
+use crate::network_generation_component::{NetworkDetails, NetworkGenerationComponent};
 
 mod network_generation_component;
 
@@ -27,6 +28,9 @@ async fn main() {
             wgpu::Features::POLYGON_MODE_LINE
                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
         )
+        .window_attributes(WindowAttributes::default().with_surface_size(
+            winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(600, 600)),
+        ))
         .build()
         .await;
 
@@ -256,7 +260,9 @@ pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>) {
 
     let boundary: Vec<Vector3<f32>> = vessels
         .iter()
-        .map(|vert| (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * (AREA_SIZE as f32 / 2.0))
+        .map(|vert| {
+            (Vector3::from(vert.pos) + Vector3::new(1.0, 1.0, 0.0)) * (AREA_SIZE as f32 / 2.0)
+        })
         .collect();
 
     (vessels, boundary)

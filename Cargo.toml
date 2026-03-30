@@ -1,6 +1,6 @@
 [package]
 name = "vessel_viewer"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 
 [profile.release]
@@ -14,7 +14,7 @@ cool_utils = { git = "https://github.com/GameHunter101/cool_utils" }
 tokio = "1.49.0"
 nalgebra = "0.33.2"
 bytemuck = "1.25.0"
-winit = { version = "0.29.15" }
+winit = "0.31.0-beta.2"
 image = "0.25.9"
 pollster = "0.4.0"
 egui = "0.33.3"

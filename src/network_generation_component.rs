@@ -43,6 +43,8 @@ pub struct NetworkGenerationComponent<T> {
     display_vessel_edges_compute: ComponentId,
     #[default(vec![Vector3::zeros(); INIT_PROBE_COUNT])]
     probes: Vec<Vector3<f32>>,
+    #[default(false)]
+    reset: bool,
 }
 
 impl<T: Rng> NetworkGenerationComponent<T> {
@@ -55,20 +57,48 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             .into_iter()
             .enumerate()
             .map(|(i, val)| {
-                Vector3::new(i as f32, val as f32, 0.0) / self.num_probes as f32 * AREA_SIZE as f32
+                Vector3::new(
+                    i as f32 * AREA_SIZE as f32,
+                    val as f32 * (473.0 - 39.0),
+                    0.0,
+                ) / self.num_probes as f32
+                    + Vector3::new(0.0, 39.0, 0.0)
             })
             .collect();
         self.probes = positions.try_into().unwrap();
     }
 
+    fn update_gizmo(
+        gizmo: [Vertex; 2],
+        mesh_component: &mut MeshComponent<Vertex>,
+        device: &Device,
+        queue: &Queue,
+    ) {
+        mesh_component.update_vertices(
+            gizmo.to_vec(),
+            if mesh_component.vertices().len() == 1 {
+                None
+            } else {
+                Some(1)
+            },
+            device,
+            queue,
+            true,
+        );
+    }
+
     fn update_buffers(
         new_edge: [Vector3<f32>; 2],
-        current_iter: usize,
         mesh_component: &mut MeshComponent<Vertex>,
         visualization_buffer: &mut ShaderBufferAttachment,
         device: &Device,
         queue: &Queue,
+        boundary_verts: Vec<Vertex>,
+        reset: bool,
     ) {
+        if reset {
+            mesh_component.update_vertices(boundary_verts, Some(0), device, queue, true);
+        }
         mesh_component.update_vertices(
             new_edge
                 .map(|position| Vertex {
@@ -79,7 +109,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             Some(0),
             device,
             queue,
-            current_iter == 0 && mesh_component.vertices()[0].len() > 4,
+            false,
         );
         let verts = &mesh_component.vertices()[0];
         let edges: Vec<ComputeEdge> = verts
@@ -205,7 +235,8 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                 Vector3::new(0.0, 0.0, 1.0),
             ]
             .map(|offset| self.eval_sdf_field(point + offset * h).0 - val_at_point),
-        ) / h
+        )
+        .normalize()
     }
 
     fn raycast_in_dir(
@@ -215,7 +246,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         max_dist: f32,
         max_iter_count: u32,
         min_dist: f32,
-    ) -> (f32, usize) {
+    ) -> (f32, usize, Vector3<f32>) {
         let mut pos = origin;
         let mut closest_edge = self.eval_sdf_field(origin).1;
         let mut distance = 0.0;
@@ -232,7 +263,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             }
         }
 
-        (distance, closest_edge)
+        (distance, closest_edge, pos)
     }
 }
 
@@ -259,9 +290,40 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             device,
             queue,
             computes,
+            engine_details,
             ..
         }: UpdateParams<'_, '_>,
     ) -> ActionQueue {
+        if let Some(component) = other_components
+            .iter_mut()
+            .filter(|comp| comp.id() == self.vessel_edges_component)
+            .next()
+        {
+            let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
+            let raw_cursor_pos = engine_details.cursor_position;
+            let cursor_pos = Vector3::new(
+                raw_cursor_pos.0 as f32,
+                (engine_details.window_resolution.1 - raw_cursor_pos.1) as f32,
+                0.0,
+            );
+            let gradient = self.sdf_field_gradient(cursor_pos, 0.1);
+            let end_pos = cursor_pos + gradient * self.eval_sdf_field(cursor_pos).0;
+            Self::update_gizmo(
+                [cursor_pos, end_pos].map(|position| Vertex {
+                    pos: (Vector3::new(
+                        position.x / (engine_details.window_resolution.0 as f32 / 2.0),
+                        position.y / (engine_details.window_resolution.1 as f32 / 2.0),
+                        position.z,
+                    ) - Vector3::new(1.0, 1.0, 0.0))
+                    .into(),
+                    color: [1.0, 1.0, 0.0, 1.0],
+                }),
+                mesh_component,
+                device,
+                queue,
+            );
+        }
+
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
         }
@@ -293,15 +355,36 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
 
-        println!("Pos: {:?}, grad: {sdf_gradient}", (target_oxygen_probe.x, target_oxygen_probe.y));
+        // println!("Pos: {:?}, grad: {sdf_gradient}", (target_oxygen_probe.x, target_oxygen_probe.y));
+        /* println!("-----------------------");
+        for edge in &self.edges {
+            println!(
+                "polygon({:?})",
+                edge.map(|i| {
+                    let p = self.boundary_verts[i];
+                    (p.x, p.y)
+                })
+            );
+        }
 
-        let (_, first_edge_index) =
+        println!("?????????");
+
+        for probe in &self.probes {
+            let grad = self.sdf_field_gradient(*probe, 0.01);
+            let other_point = probe - grad * self.eval_sdf_field(*probe).0;
+            println!(
+                "polygon({:?})",
+                [(probe.x, probe.y), (other_point.x, other_point.y)]
+            );
+        } */
+
+        let (_, first_edge_index, first_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01);
-        let (_, second_edge_index) =
+        let (_, second_edge_index, second_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
 
-        let first_edge = self.edges[first_edge_index].map(|i| self.boundary_verts[i]);
-        let second_edge = self.edges[second_edge_index].map(|i| self.boundary_verts[i]);
+        /* let first_edge = self.edges[first_edge_index].map(|i| self.boundary_verts[i]);
+        let second_edge = self.edges[second_edge_index].map(|i| self.boundary_verts[i]); */
 
         /* let first_projection = clamp_vector_on_edge(vector_project(
             first_edge[1] - first_edge[0],
@@ -353,7 +436,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 
         let second_target_edge = second_target_edge_indices.map(|i| self.boundary_verts[i]); */
 
-        let sweep_subdivision = 5;
+        /* let sweep_subdivision = 5;
         let saturation_subdivision = NonZeroU32::new(10).unwrap();
         let first_sweep_result = self.sweep_single_endpoint_for_lowest_oxygen(
             sweep_subdivision,
@@ -370,10 +453,30 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             saturation_subdivision,
             self.network_parameters
                 .edge_lerp_concentration_to_edge_perpendicular,
-        );
+        ); */
 
-        let new_edge = [first_sweep_result, second_sweep_result];
-        println!("polygon({:?})", new_edge.map(|p| (p.x, p.y)));
+        // let new_edge = [first_sweep_result, second_sweep_result];
+        if (first_raycast_pos.x > AREA_SIZE as f32 || first_raycast_pos.x < 0.0/* || first_raycast_pos.y > AREA_SIZE as f32
+        || first_raycast_pos.y < 0.0 */)
+            || (second_raycast_pos.x > AREA_SIZE as f32 || second_raycast_pos.x < 0.0/* || second_raycast_pos.y > AREA_SIZE as f32
+            || second_raycast_pos.y < 0.0 */)
+        {
+            self.distribute_probes();
+            return Vec::new();
+        }
+
+        let new_edge = [first_raycast_pos, second_raycast_pos];
+        let temp = target_oxygen_probe + sdf_gradient * self.eval_sdf_field(target_oxygen_probe).0;
+        println!(
+            "Target probe: {:?}, gradient: {:?}, raycast: {:?}",
+            (target_oxygen_probe.x, target_oxygen_probe.y),
+            (temp.x, temp.y),
+            [
+                (first_raycast_pos.x, first_raycast_pos.y),
+                (second_raycast_pos.x, second_raycast_pos.y)
+            ]
+        );
+        println!("New edge: polygon({:?})", new_edge.map(|p| (p.x, p.y)));
 
         self.edges
             .push([self.boundary_verts.len(), self.boundary_verts.len() + 1]);
@@ -392,11 +495,19 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
             Self::update_buffers(
                 new_edge,
-                self.current_iter,
                 mesh_component,
                 buf,
                 device,
                 queue,
+                self.edges[0..2]
+                    .iter()
+                    .flatten()
+                    .map(|&i| Vertex {
+                        pos: (self.boundary_verts[i] / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
+                        color: [0.5, 0.0, 0.5, 1.0],
+                    })
+                    .collect(),
+                self.reset,
             );
         }
 
@@ -405,6 +516,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         self.num_probes += 1;
 
         self.distribute_probes();
+        self.reset = false;
 
         Vec::new()
     }
@@ -444,6 +556,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         let (_, boundary) = initialize_points();
                         self.boundary_verts = boundary;
                         self.edges = vec![[0, 1], [2, 3]];
+                        self.reset = true;
                     }
 
                     distance_to_length_factor_slider
