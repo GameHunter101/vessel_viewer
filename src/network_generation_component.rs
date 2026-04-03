@@ -44,8 +44,6 @@ pub struct NetworkGenerationComponent<T> {
     display_vessel_edges_compute: ComponentId,
     #[default(vec![Vector3::zeros(); INIT_PROBE_COUNT])]
     probes: Vec<Vector3<f32>>,
-    #[default(false)]
-    reset: bool,
 }
 
 impl<T: Rng> NetworkGenerationComponent<T> {
@@ -69,64 +67,31 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         self.probes = positions.try_into().unwrap();
     }
 
-    fn update_gizmo(
-        gizmo: [Vertex; 2],
-        mesh_component: &mut MeshComponent<Vertex>,
-        device: &Device,
-        queue: &Queue,
-    ) {
-        mesh_component.update_vertices(
-            gizmo.to_vec(),
-            if mesh_component.vertices().len() == 1 {
-                None
-            } else {
-                Some(1)
-            },
-            device,
-            queue,
-            true,
-        );
-    }
-
     fn update_buffers(
-        new_edge: [Vector3<f32>; 2],
+        all_edges: Vec<[Vector3<f32>; 2]>,
         mesh_component: &mut MeshComponent<Vertex>,
         visualization_buffer: &mut ShaderBufferAttachment,
         device: &Device,
         queue: &Queue,
-        boundary_verts: Vec<Vertex>,
-        reset: bool,
     ) {
-        if reset {
-            mesh_component.update_vertices(boundary_verts, Some(0), device, queue, true);
-        }
         mesh_component.update_vertices(
-            new_edge
-                .map(|position| Vertex {
-                    pos: (position / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
-                    color: [0.5, 0.0, 0.5, 1.0],
+            all_edges
+                .iter()
+                .flat_map(|edge| {
+                    edge.map(|position| Vertex {
+                        pos: (position / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
+                        color: [0.5, 0.0, 0.5, 1.0],
+                    })
                 })
-                .to_vec(),
+                .collect::<Vec<_>>(),
             Some(0),
             device,
             queue,
-            false,
+            true,
         );
-        let verts = &mesh_component.vertices()[0];
-        let edges: Vec<ComputeEdge> = verts
-            .chunks(2)
-            .map(|chunk| {
-                ComputeEdge::new(
-                    [
-                        (chunk[0].pos[0] + 1.0) * 256.0,
-                        (chunk[0].pos[1] + 1.0) * 256.0,
-                    ],
-                    [
-                        (chunk[1].pos[0] + 1.0) * 256.0,
-                        (chunk[1].pos[1] + 1.0) * 256.0,
-                    ],
-                )
-            })
+        let edges: Vec<ComputeEdge> = all_edges
+            .iter()
+            .map(|edge| ComputeEdge::new([edge[0].x, edge[0].y], [edge[1].x, edge[1].y]))
             .collect();
 
         let edge_count = edges.len();
@@ -146,66 +111,8 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         );
     }
 
-    fn calc_saturation_at_point(&self, point: Vector3<f32>) -> f32 {
-        self.edges
-            .iter()
-            .map(|edge| {
-                let [p0, p1] = edge.map(|i| self.boundary_verts[i]);
-                let projection = vector_project(p1 - p0, point - p0);
-                self.vessel_oxygen_transport_distance
-                    - projection
-                        .metric_distance(&(point - p0))
-                        .min(self.vessel_oxygen_transport_distance)
-            })
-            .sum()
-    }
-
-    /// Calculates the total oxygen in the field along the current edge.
-    /// Excludes oxygen calculation at edge endpoints, as it is quite uniform across all endpoints
-    fn calc_saturation_along_edge(&self, edge: [Vector3<f32>; 2], subdivisions: NonZeroU32) -> f32 {
-        let subdivisions = subdivisions.get();
-        (1..=subdivisions)
-            .map(|i| {
-                let t = (i as f32) / (subdivisions as f32 + 2.0);
-                let pos = edge[0] + t * (edge[1] - edge[0]);
-                self.calc_saturation_at_point(pos)
-            })
-            .sum()
-    }
-
-    /// Sweeps a single edge point across its vessel to find the edge with minimum oxygen
-    fn sweep_single_endpoint_for_lowest_oxygen(
-        &self,
-        sweep_subdivisions: u32,
-        fixed_point: Vector3<f32>,
-        sweep_edge: [Vector3<f32>; 2],
-        saturation_subdivisions: NonZeroU32,
-        perpendicular_lerp_factor: f32,
-    ) -> Vector3<f32> {
-        (0..=(sweep_subdivisions + 1))
-            .map(|i| {
-                sweep_edge[0]
-                    + (sweep_edge[1] - sweep_edge[0]) * (i as f32)
-                        / (sweep_subdivisions as f32 + 1.0)
-            })
-            .min_by_key(|current_sweep_point| {
-                let edge_saturation = self.calc_saturation_along_edge(
-                    [*current_sweep_point, fixed_point],
-                    saturation_subdivisions,
-                );
-
-                OrderedFloat(lerp(
-                    edge_saturation,
-                    (current_sweep_point - sweep_edge[0])
-                        .normalize()
-                        .dot(&(current_sweep_point - fixed_point).normalize())
-                        .abs(),
-                    perpendicular_lerp_factor,
-                ))
-            })
-            .unwrap()
-    }
-
+    /// The SDF function for an edge defined by two points.
+    /// Sourced from https://iquilezles.org/articles/distfunctions2d/
     fn edge_sdf(&self, edge: [usize; 2], point: Vector3<f32>) -> f32 {
         let [a, b] = edge.map(|i| self.boundary_verts[i]);
         let pa = point - a;
@@ -227,19 +134,24 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         (distance.into_inner(), edge_index)
     }
 
+    /// Finite difference approximation for the gradient of the SDF. Used to direct the raycasting
+    /// algorithm in the direction of highest oxygen change, which will send it to a nearby blood vessel
     fn sdf_field_gradient(&self, point: Vector3<f32>, h: f32) -> Vector3<f32> {
         let val_at_point = self.eval_sdf_field(point).0;
-        Vector3::from(
-            [
-                Vector3::new(1.0, 0.0, 0.0),
-                Vector3::new(0.0, 1.0, 0.0),
-                Vector3::new(0.0, 0.0, 0.0),
-            ]
-            .map(|offset| val_at_point - self.eval_sdf_field(point + offset * h).0),
-        )
+        [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 0.0), // Temporary, while working in 2D
+        ]
+        .map(|offset| offset * (val_at_point - self.eval_sdf_field(point + offset * h).0))
+        .into_iter()
+        .sum::<Vector3<f32>>()
         .normalize()
     }
 
+    /// Raycasting uses signed-distance fields to step through the scene in steps as large as
+    /// possible while maintaining full accuracy. Used to find nearby target attachment points on
+    /// other blood vessels
     fn raycast_in_dir(
         &self,
         origin: Vector3<f32>,
@@ -267,6 +179,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         (distance, closest_edge, pos)
     }
 
+    /// Displays a line at the cursor in the direction of the sdf field with proper magnitude
     fn show_gizmo(
         &self,
         other_components: &mut [&mut Component],
@@ -293,13 +206,153 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             Self::update_gizmo(
                 [cursor_pos, end_pos].map(|position| Vertex {
                     pos: (position / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
-                    color: [1.0, 1.0, 0.0, 1.0],
+                    color: [0.0, 1.0, 0.0, 1.0],
                 }),
                 mesh_component,
                 device,
                 queue,
             );
         }
+    }
+
+    fn update_gizmo(
+        gizmo: [Vertex; 2],
+        mesh_component: &mut MeshComponent<Vertex>,
+        device: &Device,
+        queue: &Queue,
+    ) {
+        mesh_component.update_vertices(
+            gizmo.to_vec(),
+            if mesh_component.vertices().len() == 1 {
+                None
+            } else {
+                Some(1)
+            },
+            device,
+            queue,
+            true,
+        );
+    }
+
+    fn distance_to_edge(
+        &self,
+        edge_vertex_indices: [usize; 2],
+        position: Vector3<f32>,
+    ) -> OrderedFloat<f32> {
+        let origin = self.boundary_verts[edge_vertex_indices[0]];
+        let edge_vector = self.boundary_verts[edge_vertex_indices[1]] - origin;
+        OrderedFloat(
+            (vector_project(edge_vector, position - origin) - (position - origin)).norm_squared(),
+        )
+    }
+
+    /// Splits an existing edge at a point, unless the point is too close to an endpoint of the
+    /// edge to warrant a split. Returns the index of the split point in the `boundary_verts` vector
+    fn split_edge_with_new_point(&mut self, edge: usize, new_point: Vector3<f32>) -> usize {
+        let edge_indices = self.edges[edge];
+        let edge_points = edge_indices.map(|i| self.boundary_verts[i]);
+        if let Some((i, _)) = edge_points
+            .into_iter()
+            .enumerate()
+            .filter(|(_, point)| {
+                let res = points_are_close(*point, new_point);
+                println!(
+                    "Point: {:?}, edge point: {:?}, close: {res}",
+                    (new_point.x, new_point.y),
+                    (point.x, point.y)
+                );
+                res
+            })
+            .next()
+        {
+            return edge_indices[i];
+        }
+
+        let new_point_index = self.boundary_verts.len();
+        self.boundary_verts.push(new_point);
+        self.edges[edge] = [
+            edge_indices[0].min(new_point_index),
+            edge_indices[0].max(new_point_index),
+        ];
+        self.edges.push([
+            edge_indices[1].min(new_point_index),
+            edge_indices[1].max(new_point_index),
+        ]);
+
+        new_point_index
+    }
+
+    fn calc_saturation_at_point(&self, point: Vector3<f32>) -> f32 {
+        self.edges
+            .iter()
+            .map(|edge| {
+                let [p0, p1] = edge.map(|i| self.boundary_verts[i]);
+                let projection = vector_project(p1 - p0, point - p0);
+                self.vessel_oxygen_transport_distance
+                    - projection
+                        .metric_distance(&(point - p0))
+                        .min(self.vessel_oxygen_transport_distance)
+            })
+            .sum()
+    }
+
+    /// Calculates the total oxygen in the field along the current edge.
+    /// Excludes oxygen calculation at edge endpoints, as it is quite uniform across all endpoints
+    fn calc_saturation_along_edge(&self, edge: [Vector3<f32>; 2], subdivisions: NonZeroU32) -> f32 {
+        let subdivisions = subdivisions.get();
+        (1..=subdivisions)
+            .map(|i| {
+                let t = (i as f32) / (subdivisions as f32 + 2.0);
+                let pos = edge[0] + t * (edge[1] - edge[0]);
+                let sat = self.calc_saturation_at_point(pos);
+                return sat;
+            })
+            .sum()
+    }
+
+    /// Sweeps a single edge point across its vessel to find the edge with minimum oxygen
+    fn find_minimum_oxygen_edge(
+        &self,
+        sweep_subdivisions: u32,
+        edges: [[Vector3<f32>; 2]; 2],
+        saturation_subdivisions: NonZeroU32,
+        // perpendicular_lerp_factor: f32,
+    ) -> [Vector3<f32>; 2] {
+        (0..=(sweep_subdivisions + 1))
+            .flat_map(|first_sweep_index| {
+                let first_sweep_pos = lerp(
+                    edges[0][0],
+                    edges[0][1],
+                    first_sweep_index as f32 / (sweep_subdivisions as f32 + 1.0),
+                );
+                (0..=sweep_subdivisions + 1)
+                    .map(|second_sweep_index| {
+                        let second_sweep_pos = lerp(
+                            edges[1][0],
+                            edges[1][1],
+                            second_sweep_index as f32 / (sweep_subdivisions as f32 + 1.0),
+                        );
+                        [first_sweep_pos, second_sweep_pos]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .min_by_key(|current_edge| {
+                let edge_saturation =
+                    self.calc_saturation_along_edge(*current_edge, saturation_subdivisions);
+                // println!("polygon({:?}), saturation: {edge_saturation}", current_edge.map(|p| (p.x, p.y)));
+                OrderedFloat(edge_saturation)
+
+                /* let normalized_edge_dir = (current_edge[1] - current_edge[0]).normalize();
+
+                OrderedFloat(lerp(
+                    edge_saturation,
+                    normalized_edge_dir
+                        .dot(&(current_sweep_point - fixed_point).normalize())
+                        .abs(),
+                    perpendicular_lerp_factor,
+                )) */
+            })
+            .unwrap()
     }
 }
 
@@ -336,16 +389,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
-        let distance_to_edge =
-            |edge_vertex_indices: &&[usize; 2], position: Vector3<f32>| -> OrderedFloat<f32> {
-                let origin = self.boundary_verts[edge_vertex_indices[0]];
-                let edge_vector = self.boundary_verts[edge_vertex_indices[1]] - origin;
-                OrderedFloat(
-                    (vector_project(edge_vector, position - origin) - (position - origin))
-                        .norm_squared(),
-                )
-            };
-
         let target_oxygen_probe = *self
             .probes
             .iter()
@@ -354,116 +397,42 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                     .edges
                     .iter()
                     .min_by_key(|edge_vertex_indices| {
-                        distance_to_edge(edge_vertex_indices, position)
+                        self.distance_to_edge(**edge_vertex_indices, position)
                     })
                     .unwrap();
-                distance_to_edge(&closest_edge, position)
+                self.distance_to_edge(*closest_edge, position)
             })
             .unwrap();
 
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
 
-        let (_, first_edge_index, first_raycast_pos) =
+        let (_, first_edge_index, _first_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01);
-        let (_, second_edge_index, second_raycast_pos) =
+        let (_, second_edge_index, _second_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
 
-        /* let first_edge = self.edges[first_edge_index].map(|i| self.boundary_verts[i]);
-        let second_edge = self.edges[second_edge_index].map(|i| self.boundary_verts[i]); */
-
-        /* let first_projection = clamp_vector_on_edge(vector_project(
-            first_edge[1] - first_edge[0],
-            target_oxygen_probe - first_edge[0],
-        ) + first_edge[0], first_edge);
-
-        let second_projection = clamp_vector_on_edge(vector_project(
-            second_edge[1] - second_edge[0],
-            target_oxygen_probe - second_edge[0],
-        ) + second_edge[0], second_edge); */
-
-        // let new_edge = [first_projection, second_projection];
-
-        /* let first_target_edge_indices = self
-            .edges
-            .iter()
-            .min_by_key(|edge_vertex_indices| {
-                let distance =
-                    distance_to_edge(edge_vertex_indices, target_oxygen_probe).into_inner();
-                let edge = edge_vertex_indices.map(|i| self.boundary_verts[i]);
-                OrderedFloat(lerp(
-                    distance,
-                    AREA_SIZE as f32 - (edge[1] - edge[0]).norm(),
-                    self.network_parameters.edge_lerp_distance_to_length_factor,
-                ))
-            })
-            .unwrap();
-
-        let first_target_edge = first_target_edge_indices.map(|i| self.boundary_verts[i]);
-
-        let second_target_edge_indices = self
-            .edges
-            .iter()
-            .filter(|edge_indices| {
-                let [v0, v1] = edge_indices;
-                *v0 != first_target_edge_indices[0] || *v1 != first_target_edge_indices[1]
-            })
-            .min_by_key(|edge_vertex_indices| {
-                let distance =
-                    distance_to_edge(edge_vertex_indices, target_oxygen_probe).into_inner();
-                let edge = edge_vertex_indices.map(|i| self.boundary_verts[i]);
-                OrderedFloat(lerp(
-                    distance,
-                    AREA_SIZE as f32 * std::f32::consts::SQRT_2 - (edge[1] - edge[0]).norm(),
-                    self.network_parameters.edge_lerp_distance_to_length_factor,
-                ))
-            })
-            .unwrap();
-
-        let second_target_edge = second_target_edge_indices.map(|i| self.boundary_verts[i]); */
-
-        /* let sweep_subdivision = 5;
-        let saturation_subdivision = NonZeroU32::new(10).unwrap();
-        let first_sweep_result = self.sweep_single_endpoint_for_lowest_oxygen(
-            sweep_subdivision,
-            second_edge[0],
-            first_edge,
-            saturation_subdivision,
-            0.0,
+        let min_oxygen_edge = self.find_minimum_oxygen_edge(
+            10,
+            [first_edge_index, second_edge_index]
+                .map(|edge_index| self.edges[edge_index].map(|i| self.boundary_verts[i])),
+            NonZeroU32::new(10).unwrap(),
         );
 
-        let second_sweep_result = self.sweep_single_endpoint_for_lowest_oxygen(
-            sweep_subdivision,
-            first_sweep_result,
-            second_edge,
-            saturation_subdivision,
-            self.network_parameters
-                .edge_lerp_concentration_to_edge_perpendicular,
-        ); */
-
-        // let new_edge = [first_sweep_result, second_sweep_result];
-        if (first_raycast_pos.x > AREA_SIZE as f32 || first_raycast_pos.x < 0.0)
-            || (second_raycast_pos.x > AREA_SIZE as f32 || second_raycast_pos.x < 0.0)
+        // TODO: Temporary barrier detection, replace with more elegant detection and edge redirection
+        if (min_oxygen_edge[0].x > AREA_SIZE as f32 || min_oxygen_edge[0].x < 0.0)
+            || (min_oxygen_edge[1].x > AREA_SIZE as f32 || min_oxygen_edge[1].x < 0.0)
         {
             self.distribute_probes();
             return Vec::new();
         }
 
-        let new_edge = [first_raycast_pos, second_raycast_pos];
-        let temp = target_oxygen_probe + sdf_gradient * self.eval_sdf_field(target_oxygen_probe).0;
-        println!(
-            "Target probe: {:?}, gradient: {:?}, raycast: {:?}",
-            (target_oxygen_probe.x, target_oxygen_probe.y),
-            (temp.x, temp.y),
-            [
-                (first_raycast_pos.x, first_raycast_pos.y),
-                (second_raycast_pos.x, second_raycast_pos.y)
-            ]
-        );
-        println!("New edge: polygon({:?})", new_edge.map(|p| (p.x, p.y)));
+        let corrected_first_edge_index =
+            self.split_edge_with_new_point(first_edge_index, min_oxygen_edge[0]);
+        let corrected_second_edge_index =
+            self.split_edge_with_new_point(second_edge_index, min_oxygen_edge[1]);
 
         self.edges
-            .push([self.boundary_verts.len(), self.boundary_verts.len() + 1]);
-        self.boundary_verts.extend_from_slice(&new_edge);
+            .push([corrected_first_edge_index, corrected_second_edge_index]);
 
         if let Some(component) = other_components
             .iter_mut()
@@ -477,29 +446,21 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         {
             let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
             Self::update_buffers(
-                new_edge,
+                self.edges
+                    .iter()
+                    .map(|edge_indices| edge_indices.map(|i| self.boundary_verts[i]))
+                    .collect(),
                 mesh_component,
                 buf,
                 device,
                 queue,
-                self.edges[0..2]
-                    .iter()
-                    .flatten()
-                    .map(|&i| Vertex {
-                        pos: (self.boundary_verts[i] / 256.0 - Vector3::new(1.0, 1.0, 0.0)).into(),
-                        color: [0.5, 0.0, 0.5, 1.0],
-                    })
-                    .collect(),
-                self.reset,
             );
         }
 
         self.current_iter += 1;
 
         self.num_probes += 1;
-
         self.distribute_probes();
-        self.reset = false;
 
         Vec::new()
     }
@@ -525,21 +486,21 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         0.0..=1.0,
                     ));
 
+                    let old_val = self.max_iter_count;
                     let iter_count = ui.add(
                         egui::DragValue::new(&mut self.max_iter_count)
-                            .range(0..=100)
+                            .range(0..=200)
                             .update_while_editing(true),
                     );
 
                     if distance_to_length_factor_slider.changed()
                         || concentration_to_angle_factor_slider.changed()
-                        || iter_count.changed()
+                        || (iter_count.changed() && self.max_iter_count < old_val)
                     {
                         self.current_iter = 0;
                         let (_, boundary) = initialize_points();
                         self.boundary_verts = boundary;
                         self.edges = vec![[0, 1], [2, 3]];
-                        self.reset = true;
                     }
 
                     distance_to_length_factor_slider
@@ -566,16 +527,19 @@ fn clamp_vector_on_edge(vector: Vector3<f32>, edge: [Vector3<f32>; 2]) -> Vector
     )
 }
 
+fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
+    p1.metric_distance(&p2) < 0.001
+}
+
 #[cfg(test)]
 mod test {
     use nalgebra::Vector3;
     use rand::rng;
 
-    use crate::{AREA_SIZE, network_generation_component::NetworkGenerationComponent};
-
-    fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
-        p1.metric_distance(&p2) < 0.001
-    }
+    use crate::{
+        AREA_SIZE,
+        network_generation_component::{NetworkGenerationComponent, points_are_close},
+    };
 
     #[test]
     fn sdf_test_single_edge() {
@@ -645,5 +609,35 @@ mod test {
         assert_eq!(edge, 1);
         let gradient = network.sdf_field_gradient(test_point, 0.01);
         assert!(points_are_close(gradient, Vector3::new(0.0, 1.0, 0.0)));
+    }
+
+    #[test]
+    fn simple_edge_split() {
+        let mut network = NetworkGenerationComponent::builder()
+            .rng(rng())
+            .boundary_verts(
+                [[-1.0, -0.85], [1.0, -0.85]]
+                    .map(|p| {
+                        (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
+                            * AREA_SIZE as f32
+                            / 2.0
+                    })
+                    .to_vec(),
+            )
+            .edges(vec![[0, 1]])
+            .network_parameters(crate::network_generation_component::NetworkDetails {
+                edge_lerp_distance_to_length_factor: 0.0,
+                edge_lerp_concentration_to_edge_perpendicular: 0.0,
+            })
+            .vessel_edges_component(0)
+            .display_vessel_edges_compute(0)
+            .max_iter_count(0)
+            .build();
+
+        let split_index = network.split_edge_with_new_point(0, Vector3::new(128.0, 19.2, 0.0));
+
+        assert_eq!(split_index, 2);
+        assert_eq!(network.edges.len(), 2);
+        assert_eq!(network.edges, [[0, 2], [1, 2]]);
     }
 }
