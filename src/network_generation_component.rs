@@ -20,8 +20,9 @@ use crate::{AREA_SIZE, ComputeEdge, Vertex, initialize_points};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkDetails {
-    pub edge_lerp_distance_to_length_factor: f32,
-    pub edge_lerp_concentration_to_edge_perpendicular: f32,
+    pub edge_orthogonality_lerp_factor: f32,
+    pub branch_width_factor: f32,
+    pub branch_length_factor: f32,
 }
 
 const INIT_PROBE_COUNT: usize = 50;
@@ -196,7 +197,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             let raw_cursor_pos = engine_details.cursor_position;
             let cursor_pos = Vector3::new(
                 raw_cursor_pos.0 as f32 / engine_details.window_resolution.0 as f32,
-                (engine_details.window_resolution.1 - raw_cursor_pos.1) as f32
+                (engine_details.window_resolution.1 as f32 - raw_cursor_pos.1 as f32)
                     / engine_details.window_resolution.1 as f32,
                 0.0,
             ) * AREA_SIZE as f32;
@@ -256,11 +257,6 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             .enumerate()
             .filter(|(_, point)| {
                 let res = points_are_close(*point, new_point);
-                println!(
-                    "Point: {:?}, edge point: {:?}, close: {res}",
-                    (new_point.x, new_point.y),
-                    (point.x, point.y)
-                );
                 res
             })
             .next()
@@ -316,7 +312,6 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         sweep_subdivisions: u32,
         edges: [[Vector3<f32>; 2]; 2],
         saturation_subdivisions: NonZeroU32,
-        // perpendicular_lerp_factor: f32,
     ) -> [Vector3<f32>; 2] {
         (0..=(sweep_subdivisions + 1))
             .flat_map(|first_sweep_index| {
@@ -337,22 +332,65 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                     .collect::<Vec<_>>()
             })
             .min_by_key(|current_edge| {
-                let edge_saturation =
-                    self.calc_saturation_along_edge(*current_edge, saturation_subdivisions);
-                // println!("polygon({:?}), saturation: {edge_saturation}", current_edge.map(|p| (p.x, p.y)));
-                OrderedFloat(edge_saturation)
-
-                /* let normalized_edge_dir = (current_edge[1] - current_edge[0]).normalize();
-
-                OrderedFloat(lerp(
-                    edge_saturation,
-                    normalized_edge_dir
-                        .dot(&(current_sweep_point - fixed_point).normalize())
-                        .abs(),
-                    perpendicular_lerp_factor,
-                )) */
+                OrderedFloat(
+                    self.calc_saturation_along_edge(*current_edge, saturation_subdivisions),
+                )
             })
             .unwrap()
+    }
+
+    /// Takes a straight edge and creates a branch within it.
+    /// Before: ----, after: -<>-
+    fn bifurcate_edge(
+        &mut self,
+        edge: [usize; 2],
+        branch_width_factor: f32,
+        branch_length_factor: f32,
+    ) {
+        // TODO: Replace with a more parametric solution. This does not work very well in 3D
+        let up = Vector3::<f32>::z();
+        let edge_points = edge.map(|i| self.boundary_verts[i]);
+        let edge_center = (edge_points[0] + edge_points[1]) / 2.0;
+
+        let (sdf_distance_at_edge_center, _) = self.eval_sdf_field(edge_center);
+
+        let mut branch_offset_position_indices = Vec::new();
+
+        for (point_index, edge_point) in edge_points.into_iter().enumerate() {
+            let main_dir = (edge_center - edge_point).normalize();
+            let branch_dir =
+                branch_width_factor * sdf_distance_at_edge_center * main_dir.cross(&up);
+            let first_branch_pos = edge_center + branch_dir;
+            let second_branch_pos = edge_center - branch_dir;
+            let first_branch_index = branch_offset_position_indices
+                .get(0)
+                .copied()
+                .unwrap_or_else(|| {
+                    let index = self.boundary_verts.len();
+                    branch_offset_position_indices.push(index);
+                    self.boundary_verts.push(first_branch_pos);
+                    index
+                });
+
+            let second_branch_index = branch_offset_position_indices
+                .get(1)
+                .copied()
+                .unwrap_or_else(|| {
+                    let index = self.boundary_verts.len();
+                    branch_offset_position_indices.push(index);
+                    self.boundary_verts.push(second_branch_pos);
+                    index
+                });
+
+            let branch_start_point = lerp(edge_center, edge_point, branch_length_factor);
+            let branch_start_index = self.boundary_verts.len();
+            self.boundary_verts.push(branch_start_point);
+            self.edges.extend_from_slice(&[
+                [edge[point_index], branch_start_index],
+                [branch_start_index, first_branch_index],
+                [branch_start_index, second_branch_index],
+            ]);
+        }
     }
 }
 
@@ -406,10 +444,11 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
 
-        let (_, first_edge_index, _first_raycast_pos) =
+        let (_, first_edge_index, first_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01);
-        let (_, second_edge_index, _second_raycast_pos) =
+        let (_, second_edge_index, second_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
+        let raycast_edges = [first_raycast_pos, second_raycast_pos];
 
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
@@ -418,21 +457,34 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             NonZeroU32::new(10).unwrap(),
         );
 
+        let new_edge_points = [0, 1].map(|i| {
+            lerp(
+                min_oxygen_edge[i],
+                raycast_edges[i],
+                self.network_parameters.edge_orthogonality_lerp_factor,
+            )
+        });
+
         // TODO: Temporary barrier detection, replace with more elegant detection and edge redirection
-        if (min_oxygen_edge[0].x > AREA_SIZE as f32 || min_oxygen_edge[0].x < 0.0)
-            || (min_oxygen_edge[1].x > AREA_SIZE as f32 || min_oxygen_edge[1].x < 0.0)
+        if (new_edge_points[0].x > AREA_SIZE as f32 || new_edge_points[0].x < 0.0)
+            || (new_edge_points[1].x > AREA_SIZE as f32 || new_edge_points[1].x < 0.0)
         {
             self.distribute_probes();
             return Vec::new();
         }
 
         let corrected_first_edge_index =
-            self.split_edge_with_new_point(first_edge_index, min_oxygen_edge[0]);
+            self.split_edge_with_new_point(first_edge_index, new_edge_points[0]);
         let corrected_second_edge_index =
-            self.split_edge_with_new_point(second_edge_index, min_oxygen_edge[1]);
+            self.split_edge_with_new_point(second_edge_index, new_edge_points[1]);
 
-        self.edges
-            .push([corrected_first_edge_index, corrected_second_edge_index]);
+        let new_edge_indices = [corrected_first_edge_index, corrected_second_edge_index];
+
+        self.bifurcate_edge(
+            new_edge_indices,
+            self.network_parameters.branch_width_factor,
+            self.network_parameters.branch_length_factor,
+        );
 
         if let Some(component) = other_components
             .iter_mut()
@@ -470,19 +522,21 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
                 egui::Frame::dark_canvas(&Default::default()).show(ui, |ui| {
-                    let distance_to_length_factor_label =
-                        ui.label("Lerp from edge distance to length");
-                    let distance_to_length_factor_slider = ui.add(egui::Slider::new(
-                        &mut self.network_parameters.edge_lerp_distance_to_length_factor,
+                    let branch_width_factor_label = ui.label("Branch width factor");
+                    let branch_width_factor_slider = ui.add(egui::Slider::new(
+                        &mut self.network_parameters.branch_width_factor,
                         0.0..=1.0,
                     ));
 
-                    let concentration_to_angle_factor_label =
-                        ui.label("Lerp from ox concentration to perpendicularity");
-                    let concentration_to_angle_factor_slider = ui.add(egui::Slider::new(
-                        &mut self
-                            .network_parameters
-                            .edge_lerp_concentration_to_edge_perpendicular,
+                    let branch_length_factor_label = ui.label("Branch length factor");
+                    let branch_length_factor_slider = ui.add(egui::Slider::new(
+                        &mut self.network_parameters.branch_length_factor,
+                        0.0..=1.0,
+                    ));
+
+                    let orthogonality_lerp_factor_label = ui.label("Orthogonality lerp factor");
+                    let orthogonality_factor_slider = ui.add(egui::Slider::new(
+                        &mut self.network_parameters.edge_orthogonality_lerp_factor,
                         0.0..=1.0,
                     ));
 
@@ -493,8 +547,9 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                             .update_while_editing(true),
                     );
 
-                    if distance_to_length_factor_slider.changed()
-                        || concentration_to_angle_factor_slider.changed()
+                    if branch_width_factor_slider.changed()
+                        || branch_length_factor_slider.changed()
+                        || orthogonality_factor_slider.changed()
                         || (iter_count.changed() && self.max_iter_count < old_val)
                     {
                         self.current_iter = 0;
@@ -503,10 +558,9 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         self.edges = vec![[0, 1], [2, 3]];
                     }
 
-                    distance_to_length_factor_slider
-                        .labelled_by(distance_to_length_factor_label.id);
-                    concentration_to_angle_factor_slider
-                        .labelled_by(concentration_to_angle_factor_label.id);
+                    orthogonality_factor_slider.labelled_by(orthogonality_lerp_factor_label.id);
+                    branch_width_factor_slider.labelled_by(branch_width_factor_label.id);
+                    branch_length_factor_slider.labelled_by(branch_length_factor_label.id);
                 });
             });
     }
@@ -520,12 +574,12 @@ fn lerp<T: std::ops::Add<Output = T> + std::ops::Mul<f32, Output = T>>(a: T, b: 
     a * (1.0 - t) + b * t
 }
 
-fn clamp_vector_on_edge(vector: Vector3<f32>, edge: [Vector3<f32>; 2]) -> Vector3<f32> {
+/* fn clamp_vector_on_edge(vector: Vector3<f32>, edge: [Vector3<f32>; 2]) -> Vector3<f32> {
     Vector3::from_iterator(
         (0_usize..3)
             .map(|i| vector[i].clamp(edge[0][i].min(edge[1][i]), edge[0][i].max(edge[1][i]))),
     )
-}
+} */
 
 fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
     p1.metric_distance(&p2) < 0.001
@@ -556,8 +610,9 @@ mod test {
             )
             .edges(vec![[0, 1]])
             .network_parameters(crate::network_generation_component::NetworkDetails {
-                edge_lerp_distance_to_length_factor: 0.0,
-                edge_lerp_concentration_to_edge_perpendicular: 0.0,
+                edge_orthogonality_lerp_factor: 0.0,
+                branch_length_factor: 0.5,
+                branch_width_factor: 0.5,
             })
             .vessel_edges_component(0)
             .display_vessel_edges_compute(0)
@@ -592,8 +647,9 @@ mod test {
             )
             .edges(vec![[0, 1], [2, 3]])
             .network_parameters(crate::network_generation_component::NetworkDetails {
-                edge_lerp_distance_to_length_factor: 0.0,
-                edge_lerp_concentration_to_edge_perpendicular: 0.0,
+                edge_orthogonality_lerp_factor: 0.0,
+                branch_length_factor: 0.5,
+                branch_width_factor: 0.5,
             })
             .vessel_edges_component(0)
             .display_vessel_edges_compute(0)
@@ -626,8 +682,9 @@ mod test {
             )
             .edges(vec![[0, 1]])
             .network_parameters(crate::network_generation_component::NetworkDetails {
-                edge_lerp_distance_to_length_factor: 0.0,
-                edge_lerp_concentration_to_edge_perpendicular: 0.0,
+                edge_orthogonality_lerp_factor: 0.0,
+                branch_length_factor: 0.5,
+                branch_width_factor: 0.5,
             })
             .vessel_edges_component(0)
             .display_vessel_edges_compute(0)
