@@ -20,6 +20,7 @@ use winit::window::WindowAttributes;
 use crate::network_generation_component::{NetworkDetails, NetworkGenerationComponent};
 
 mod network_generation_component;
+mod spatial_edge_hash;
 
 #[tokio::main]
 async fn main() {
@@ -148,7 +149,7 @@ async fn main() {
                         }),
                     ],
                 shader_path: "shaders/oxygen_compute.wgsl",
-                workgroup_counts: (512, 512, 1),
+                workgroup_counts: v4::ecs::compute::WorkgroupCounts::Static(512, 512, 1),
                 ident: "vessel_compute"
             )],
         },

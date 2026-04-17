@@ -278,29 +278,44 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         new_point_index
     }
 
-    fn calc_saturation_at_point(&self, point: Vector3<f32>) -> f32 {
-        self.edges
+    fn calc_saturation_at_point(
+        point: Vector3<f32>,
+        edges: &[[usize; 2]],
+        boundary_verts: &[Vector3<f32>],
+        oxygen_distance: f32,
+    ) -> f32 {
+        /* let (dist, _) = self.eval_sdf_field(point);
+        dist.min(self.vessel_oxygen_transport_distance) */
+        edges
             .iter()
             .map(|edge| {
-                let [p0, p1] = edge.map(|i| self.boundary_verts[i]);
+                let [p0, p1] = edge.map(|i| boundary_verts[i]);
                 let projection = vector_project(p1 - p0, point - p0);
-                self.vessel_oxygen_transport_distance
+                oxygen_distance
                     - projection
                         .metric_distance(&(point - p0))
-                        .min(self.vessel_oxygen_transport_distance)
+                        .min(oxygen_distance)
             })
-            .sum()
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap()
     }
 
     /// Calculates the total oxygen in the field along the current edge.
     /// Excludes oxygen calculation at edge endpoints, as it is quite uniform across all endpoints
-    fn calc_saturation_along_edge(&self, edge: [Vector3<f32>; 2], subdivisions: NonZeroU32) -> f32 {
+    fn calc_saturation_along_edge(
+        edge: [Vector3<f32>; 2],
+        subdivisions: NonZeroU32,
+        edges: &[[usize; 2]],
+        boundary_verts: &[Vector3<f32>],
+        oxygen_distance: f32,
+    ) -> f32 {
         let subdivisions = subdivisions.get();
         (1..=subdivisions)
             .map(|i| {
                 let t = (i as f32) / (subdivisions as f32 + 2.0);
                 let pos = edge[0] + t * (edge[1] - edge[0]);
-                let sat = self.calc_saturation_at_point(pos);
+                let sat =
+                    Self::calc_saturation_at_point(pos, edges, boundary_verts, oxygen_distance);
                 return sat;
             })
             .sum()
@@ -313,8 +328,10 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         edges: [[Vector3<f32>; 2]; 2],
         saturation_subdivisions: NonZeroU32,
     ) -> [Vector3<f32>; 2] {
-        (0..=(sweep_subdivisions + 1))
-            .flat_map(|first_sweep_index| {
+        let all_edges = &self.edges;
+        let boundary_verts = &self.boundary_verts;
+        let (_, res) = async_scoped::TokioScope::scope_and_block(|scope| {
+            for current_edge in (0..=(sweep_subdivisions + 1)).flat_map(|first_sweep_index| {
                 let first_sweep_pos = lerp(
                     edges[0][0],
                     edges[0][1],
@@ -330,13 +347,21 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                         [first_sweep_pos, second_sweep_pos]
                     })
                     .collect::<Vec<_>>()
-            })
-            .min_by_key(|current_edge| {
-                OrderedFloat(
-                    self.calc_saturation_along_edge(*current_edge, saturation_subdivisions),
-                )
-            })
-            .unwrap()
+            }) {
+                let oxygen_distance = self.vessel_oxygen_transport_distance;
+                scope.spawn(async move {
+                    (OrderedFloat(Self::calc_saturation_along_edge(
+                        current_edge,
+                        saturation_subdivisions,
+                        all_edges,
+                        boundary_verts,
+                        oxygen_distance,
+                    )), current_edge)
+                });
+            }
+        });
+
+        res.into_iter().flatten().min_by_key(|(dist, _)| *dist).unwrap().1
     }
 
     /// Takes a straight edge and creates a branch within it.
@@ -427,6 +452,8 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
+        println!("Iter: {}", self.current_iter);
+
         let target_oxygen_probe = *self
             .probes
             .iter()
@@ -450,12 +477,15 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
         let raycast_edges = [first_raycast_pos, second_raycast_pos];
 
+        let a = std::time::Instant::now();
+
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
             [first_edge_index, second_edge_index]
                 .map(|edge_index| self.edges[edge_index].map(|i| self.boundary_verts[i])),
             NonZeroU32::new(10).unwrap(),
         );
+        println!("Ox time: {}", a.elapsed().as_millis());
 
         let new_edge_points = [0, 1].map(|i| {
             lerp(
@@ -513,6 +543,11 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 
         self.num_probes += 1;
         self.distribute_probes();
+
+        println!(
+            "frame time: {}",
+            engine_details.last_frame_instant.elapsed().as_millis()
+        );
 
         Vec::new()
     }
@@ -574,14 +609,7 @@ fn lerp<T: std::ops::Add<Output = T> + std::ops::Mul<f32, Output = T>>(a: T, b: 
     a * (1.0 - t) + b * t
 }
 
-/* fn clamp_vector_on_edge(vector: Vector3<f32>, edge: [Vector3<f32>; 2]) -> Vector3<f32> {
-    Vector3::from_iterator(
-        (0_usize..3)
-            .map(|i| vector[i].clamp(edge[0][i].min(edge[1][i]), edge[0][i].max(edge[1][i]))),
-    )
-} */
-
-fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
+pub fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
     p1.metric_distance(&p2) < 0.001
 }
 
