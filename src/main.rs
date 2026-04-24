@@ -17,7 +17,10 @@ use v4::{
 use wgpu::vertex_attr_array;
 use winit::window::WindowAttributes;
 
-use crate::network_generation_component::{NetworkDetails, NetworkGenerationComponent};
+use crate::{
+    network_generation_component::{NetworkDetails, NetworkGenerationComponent},
+    spatial_edge_hash::{Edge, SpatialEdgeHash},
+};
 
 mod network_generation_component;
 mod spatial_edge_hash;
@@ -122,9 +125,9 @@ async fn main() {
                 ),
                 NetworkGenerationComponent(
                     rng: StdRng::seed_from_u64(0),
-                    boundary_verts: boundary,
-                    edges: vec![[0, 1], [2, 3]],
-                    max_iter_count: 1,
+                    edge_map: SpatialEdgeHash::new(80.0, boundary),
+                    vessel_oxygen_transport_distance: 40.0,
+                    max_iter_count: 5,
                     network_parameters: NetworkDetails {
                         edge_orthogonality_lerp_factor: 0.0,
                         branch_width_factor: 0.3,
@@ -240,7 +243,7 @@ impl VertexDescriptor for DisplayVertex {
     }
 }
 
-pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>) {
+pub fn initialize_points() -> (Vec<Vertex>, Vec<Edge>) {
     let vessels = vec![
         Vertex {
             pos: [-1.0, -0.85, 0.0],
@@ -267,5 +270,8 @@ pub fn initialize_points() -> (Vec<Vertex>, Vec<Vector3<f32>>) {
         })
         .collect();
 
-    (vessels, boundary)
+    (
+        vessels,
+        vec![[boundary[0], boundary[1]], [boundary[2], boundary[3]]],
+    )
 }

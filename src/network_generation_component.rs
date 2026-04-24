@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{collections::HashSet, num::NonZeroU32};
 
 use egui::{Context, emath::OrderedFloat};
 use nalgebra::Vector3;
@@ -16,7 +16,10 @@ use v4::{
 };
 use wgpu::{Device, Queue};
 
-use crate::{AREA_SIZE, ComputeEdge, Vertex, initialize_points};
+use crate::{
+    AREA_SIZE, ComputeEdge, Vertex, initialize_points,
+    spatial_edge_hash::{Edge, SpatialEdgeHash},
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkDetails {
@@ -32,8 +35,9 @@ pub struct NetworkGenerationComponent<T> {
     rng: T,
     #[default(INIT_PROBE_COUNT)]
     num_probes: usize,
-    boundary_verts: Vec<Vector3<f32>>,
-    edges: Vec<[usize; 2]>,
+    edge_map: SpatialEdgeHash,
+    // boundary_verts: Vec<Vector3<f32>>,
+    // edges: Vec<[usize; 2]>,
     max_iter_count: usize,
     #[default(0)]
     current_iter: usize,
@@ -65,7 +69,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                     + Vector3::new(0.0, 39.0, 0.0)
             })
             .collect();
-        self.probes = positions.try_into().unwrap();
+        self.probes = positions;
     }
 
     fn update_buffers(
@@ -112,39 +116,18 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         );
     }
 
-    /// The SDF function for an edge defined by two points.
-    /// Sourced from https://iquilezles.org/articles/distfunctions2d/
-    fn edge_sdf(&self, edge: [usize; 2], point: Vector3<f32>) -> f32 {
-        let [a, b] = edge.map(|i| self.boundary_verts[i]);
-        let pa = point - a;
-        let ba = b - a;
-        let h = (pa.dot(&ba) / ba.dot(&ba)).clamp(0.0, 1.0);
-
-        (pa - ba * h).norm()
-    }
-
-    fn eval_sdf_field(&self, point: Vector3<f32>) -> (f32, usize) {
-        let (distance, edge_index) = self
-            .edges
-            .iter()
-            .enumerate()
-            .map(|(i, edge)| (OrderedFloat(self.edge_sdf(*edge, point)), i))
-            .min_by_key(|(dist, _)| *dist)
-            .unwrap();
-
-        (distance.into_inner(), edge_index)
-    }
-
     /// Finite difference approximation for the gradient of the SDF. Used to direct the raycasting
     /// algorithm in the direction of highest oxygen change, which will send it to a nearby blood vessel
     fn sdf_field_gradient(&self, point: Vector3<f32>, h: f32) -> Vector3<f32> {
-        let val_at_point = self.eval_sdf_field(point).0;
+        let val_at_point = self.edge_map.eval_sdf_field(point).unwrap().0;
         [
             Vector3::new(1.0, 0.0, 0.0),
             Vector3::new(0.0, 1.0, 0.0),
             Vector3::new(0.0, 0.0, 0.0), // Temporary, while working in 2D
         ]
-        .map(|offset| offset * (val_at_point - self.eval_sdf_field(point + offset * h).0))
+        .map(|offset| {
+            offset * (val_at_point - self.edge_map.eval_sdf_field(point + offset * h).unwrap().0)
+        })
         .into_iter()
         .sum::<Vector3<f32>>()
         .normalize()
@@ -162,13 +145,13 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         min_dist: f32,
     ) -> (f32, usize, Vector3<f32>) {
         let mut pos = origin;
-        let mut closest_edge = self.eval_sdf_field(origin).1;
+        let mut closest_edge = self.edge_map.eval_sdf_field(origin).unwrap().1;
         let mut distance = 0.0;
         for _ in 0..max_iter_count {
             if distance >= max_dist {
                 break;
             }
-            let (next_distance, edge_index) = self.eval_sdf_field(pos);
+            let (next_distance, edge_index) = self.edge_map.eval_sdf_field(pos).unwrap();
             pos += dir * next_distance;
             closest_edge = edge_index;
             distance += next_distance;
@@ -190,8 +173,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
     ) {
         if let Some(component) = other_components
             .iter_mut()
-            .filter(|comp| comp.id() == self.vessel_edges_component)
-            .next()
+            .find(|comp| comp.id() == self.vessel_edges_component)
         {
             let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
             let raw_cursor_pos = engine_details.cursor_position;
@@ -202,7 +184,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                 0.0,
             ) * AREA_SIZE as f32;
             let gradient = self.sdf_field_gradient(cursor_pos, 0.1);
-            let strength = self.eval_sdf_field(cursor_pos).0;
+            let strength = self.edge_map.eval_sdf_field(cursor_pos).unwrap().0;
             let end_pos = cursor_pos + gradient * strength;
             Self::update_gizmo(
                 [cursor_pos, end_pos].map(|position| Vertex {
@@ -235,21 +217,19 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         );
     }
 
-    fn distance_to_edge(
-        &self,
-        edge_vertex_indices: [usize; 2],
-        position: Vector3<f32>,
-    ) -> OrderedFloat<f32> {
-        let origin = self.boundary_verts[edge_vertex_indices[0]];
-        let edge_vector = self.boundary_verts[edge_vertex_indices[1]] - origin;
+    fn distance_to_edge(&self, edge_index: usize, position: Vector3<f32>) -> OrderedFloat<f32> {
+        let edge = self.edge_map.edge(edge_index);
+        let origin = edge[0];
+        let edge_vector = edge[1] - origin;
         OrderedFloat(
             (vector_project(edge_vector, position - origin) - (position - origin)).norm_squared(),
         )
     }
 
-    /// Splits an existing edge at a point, unless the point is too close to an endpoint of the
+    /* /// Splits an existing edge at a point, unless the point is too close to an endpoint of the
     /// edge to warrant a split. Returns the index of the split point in the `boundary_verts` vector
-    fn split_edge_with_new_point(&mut self, edge: usize, new_point: Vector3<f32>) -> usize {
+    fn split_edge_with_new_point(&mut self, edge_index: usize, new_point: Vector3<f32>) -> usize {
+        self.edge_map.split_edge_at_point(edge_index, new_point);
         let edge_indices = self.edges[edge];
         let edge_points = edge_indices.map(|i| self.boundary_verts[i]);
         if let Some((i, _)) = edge_points
@@ -276,20 +256,12 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         ]);
 
         new_point_index
-    }
+    } */
 
-    fn calc_saturation_at_point(
-        point: Vector3<f32>,
-        edges: &[[usize; 2]],
-        boundary_verts: &[Vector3<f32>],
-        oxygen_distance: f32,
-    ) -> f32 {
-        /* let (dist, _) = self.eval_sdf_field(point);
-        dist.min(self.vessel_oxygen_transport_distance) */
+    fn calc_saturation_at_point(point: Vector3<f32>, edges: &[Edge], oxygen_distance: f32) -> f32 {
         edges
             .iter()
-            .map(|edge| {
-                let [p0, p1] = edge.map(|i| boundary_verts[i]);
+            .map(|&[p0, p1]| {
                 let projection = vector_project(p1 - p0, point - p0);
                 oxygen_distance
                     - projection
@@ -305,8 +277,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
     fn calc_saturation_along_edge(
         edge: [Vector3<f32>; 2],
         subdivisions: NonZeroU32,
-        edges: &[[usize; 2]],
-        boundary_verts: &[Vector3<f32>],
+        edges: &[Edge],
         oxygen_distance: f32,
     ) -> f32 {
         let subdivisions = subdivisions.get();
@@ -314,9 +285,8 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             .map(|i| {
                 let t = (i as f32) / (subdivisions as f32 + 2.0);
                 let pos = edge[0] + t * (edge[1] - edge[0]);
-                let sat =
-                    Self::calc_saturation_at_point(pos, edges, boundary_verts, oxygen_distance);
-                return sat;
+
+                Self::calc_saturation_at_point(pos, edges, oxygen_distance)
             })
             .sum()
     }
@@ -328,9 +298,46 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         edges: [[Vector3<f32>; 2]; 2],
         saturation_subdivisions: NonZeroU32,
     ) -> [Vector3<f32>; 2] {
-        let all_edges = &self.edges;
-        let boundary_verts = &self.boundary_verts;
-        let (_, res) = async_scoped::TokioScope::scope_and_block(|scope| {
+        let nearby_edge_indices: HashSet<usize> = edges
+            .iter()
+            .flatten()
+            .flat_map(|&point| self.edge_map.edges_in_cells_near_point(point))
+            .collect();
+
+        let nearby_edges: Vec<Edge> = nearby_edge_indices
+            .into_iter()
+            .map(|edge_index| self.edge_map.edge(edge_index))
+            .collect();
+
+        (0..=(sweep_subdivisions + 1))
+            .flat_map(|first_sweep_index| {
+                let first_sweep_pos = lerp(
+                    edges[0][0],
+                    edges[0][1],
+                    first_sweep_index as f32 / (sweep_subdivisions as f32 + 1.0),
+                );
+                (0..=sweep_subdivisions + 1)
+                    .map(|second_sweep_index| {
+                        let second_sweep_pos = lerp(
+                            edges[1][0],
+                            edges[1][1],
+                            second_sweep_index as f32 / (sweep_subdivisions as f32 + 1.0),
+                        );
+                        [first_sweep_pos, second_sweep_pos]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .min_by_key(|current_edge| {
+                (OrderedFloat(Self::calc_saturation_along_edge(
+                    *current_edge,
+                    saturation_subdivisions,
+                    &nearby_edges,
+                    self.vessel_oxygen_transport_distance,
+                )),)
+            })
+            .unwrap()
+
+        /* let (_, res) = async_scoped::TokioScope::scope_and_block(|scope| {
             for current_edge in (0..=(sweep_subdivisions + 1)).flat_map(|first_sweep_index| {
                 let first_sweep_pos = lerp(
                     edges[0][0],
@@ -350,71 +357,48 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             }) {
                 let oxygen_distance = self.vessel_oxygen_transport_distance;
                 scope.spawn(async move {
-                    (OrderedFloat(Self::calc_saturation_along_edge(
+                    (
+                        OrderedFloat(Self::calc_saturation_along_edge(
+                            current_edge,
+                            saturation_subdivisions,
+                            &nearby_edges,
+                            oxygen_distance,
+                        )),
                         current_edge,
-                        saturation_subdivisions,
-                        all_edges,
-                        boundary_verts,
-                        oxygen_distance,
-                    )), current_edge)
+                    )
                 });
             }
         });
 
-        res.into_iter().flatten().min_by_key(|(dist, _)| *dist).unwrap().1
+        res.into_iter()
+            .flatten()
+            .min_by_key(|(dist, _)| *dist)
+            .unwrap()
+            .1 */
     }
 
     /// Takes a straight edge and creates a branch within it.
     /// Before: ----, after: -<>-
-    fn bifurcate_edge(
-        &mut self,
-        edge: [usize; 2],
-        branch_width_factor: f32,
-        branch_length_factor: f32,
-    ) {
+    fn bifurcate_edge(&mut self, edge: Edge, branch_width_factor: f32, branch_length_factor: f32) {
         // TODO: Replace with a more parametric solution. This does not work very well in 3D
         let up = Vector3::<f32>::z();
-        let edge_points = edge.map(|i| self.boundary_verts[i]);
-        let edge_center = (edge_points[0] + edge_points[1]) / 2.0;
+        let edge_center = (edge[0] + edge[1]) / 2.0;
 
-        let (sdf_distance_at_edge_center, _) = self.eval_sdf_field(edge_center);
+        let (sdf_distance_at_edge_center, _) = self.edge_map.eval_sdf_field(edge_center).unwrap();
 
-        let mut branch_offset_position_indices = Vec::new();
-
-        for (point_index, edge_point) in edge_points.into_iter().enumerate() {
+        for edge_point in edge {
             let main_dir = (edge_center - edge_point).normalize();
             let branch_dir =
                 branch_width_factor * sdf_distance_at_edge_center * main_dir.cross(&up);
-            let first_branch_pos = edge_center + branch_dir;
-            let second_branch_pos = edge_center - branch_dir;
-            let first_branch_index = branch_offset_position_indices
-                .get(0)
-                .copied()
-                .unwrap_or_else(|| {
-                    let index = self.boundary_verts.len();
-                    branch_offset_position_indices.push(index);
-                    self.boundary_verts.push(first_branch_pos);
-                    index
-                });
 
-            let second_branch_index = branch_offset_position_indices
-                .get(1)
-                .copied()
-                .unwrap_or_else(|| {
-                    let index = self.boundary_verts.len();
-                    branch_offset_position_indices.push(index);
-                    self.boundary_verts.push(second_branch_pos);
-                    index
-                });
+            let branch_apex_points = [edge_center + branch_dir, edge_center - branch_dir];
+            let branch_point = lerp(edge_center, edge_point, branch_length_factor);
 
-            let branch_start_point = lerp(edge_center, edge_point, branch_length_factor);
-            let branch_start_index = self.boundary_verts.len();
-            self.boundary_verts.push(branch_start_point);
-            self.edges.extend_from_slice(&[
-                [edge[point_index], branch_start_index],
-                [branch_start_index, first_branch_index],
-                [branch_start_index, second_branch_index],
-            ]);
+            for apex_point in branch_apex_points {
+                self.edge_map.insert_edge([branch_point, apex_point]);
+            }
+
+            self.edge_map.insert_edge([edge_point, branch_point]);
         }
     }
 }
@@ -446,6 +430,11 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             ..
         }: UpdateParams<'_, '_>,
     ) -> ActionQueue {
+        /* println!(
+            "Occupied: {}, verts: {}",
+            self.edge_map.occupied_cells(),
+            self.edge_map.verts().len()
+        ); */
         self.show_gizmo(other_components, engine_details, device, queue);
 
         if self.current_iter >= self.max_iter_count {
@@ -458,17 +447,18 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             .probes
             .iter()
             .max_by_key(|&&position| {
-                let closest_edge = self
-                    .edges
-                    .iter()
-                    .min_by_key(|edge_vertex_indices| {
-                        self.distance_to_edge(**edge_vertex_indices, position)
+                OrderedFloat(self.edge_map.eval_sdf_field(position).unwrap().0)
+                /* let closest_edge = self
+                    .edge_map
+                    .edges_in_cells_near_point(position)
+                    .into_iter()
+                    .min_by_key(|&edge_vertex_indices| {
+                        self.distance_to_edge(edge_vertex_indices, position)
                     })
                     .unwrap();
-                self.distance_to_edge(*closest_edge, position)
+                self.distance_to_edge(closest_edge, position) */
             })
             .unwrap();
-
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
 
         let (_, first_edge_index, first_raycast_pos) =
@@ -481,8 +471,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
-            [first_edge_index, second_edge_index]
-                .map(|edge_index| self.edges[edge_index].map(|i| self.boundary_verts[i])),
+            [first_edge_index, second_edge_index].map(|edge_index| self.edge_map.edge(edge_index)),
             NonZeroU32::new(10).unwrap(),
         );
         println!("Ox time: {}", a.elapsed().as_millis());
@@ -503,35 +492,27 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
-        let corrected_first_edge_index =
-            self.split_edge_with_new_point(first_edge_index, new_edge_points[0]);
-        let corrected_second_edge_index =
-            self.split_edge_with_new_point(second_edge_index, new_edge_points[1]);
 
-        let new_edge_indices = [corrected_first_edge_index, corrected_second_edge_index];
+        self.edge_map.split_edge_at_point(first_edge_index, new_edge_points[0]);
+        self.edge_map.split_edge_at_point(second_edge_index, new_edge_points[1]);
 
         self.bifurcate_edge(
-            new_edge_indices,
+            new_edge_points,
             self.network_parameters.branch_width_factor,
             self.network_parameters.branch_length_factor,
         );
 
         if let Some(component) = other_components
             .iter_mut()
-            .filter(|comp| comp.id() == self.vessel_edges_component)
-            .next()
+            .find(|comp| comp.id() == self.vessel_edges_component)
             && let Some(compute) = computes
                 .iter_mut()
-                .filter(|comp| comp.id() == self.display_vessel_edges_compute)
-                .next()
+                .find(|comp| comp.id() == self.display_vessel_edges_compute)
             && let ShaderAttachment::Buffer(buf) = &mut compute.attachments_mut()[0]
         {
             let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
             Self::update_buffers(
-                self.edges
-                    .iter()
-                    .map(|edge_indices| edge_indices.map(|i| self.boundary_verts[i]))
-                    .collect(),
+                self.edge_map.raw_edges(),
                 mesh_component,
                 buf,
                 device,
@@ -589,8 +570,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                     {
                         self.current_iter = 0;
                         let (_, boundary) = initialize_points();
-                        self.boundary_verts = boundary;
-                        self.edges = vec![[0, 1], [2, 3]];
+                        self.edge_map = SpatialEdgeHash::new(self.edge_map.cell_size(), boundary);
                     }
 
                     orthogonality_factor_slider.labelled_by(orthogonality_lerp_factor_label.id);
@@ -621,22 +601,20 @@ mod test {
     use crate::{
         AREA_SIZE,
         network_generation_component::{NetworkGenerationComponent, points_are_close},
+        spatial_edge_hash::SpatialEdgeHash,
     };
 
     #[test]
     fn sdf_test_single_edge() {
         let network = NetworkGenerationComponent::builder()
             .rng(rng())
-            .boundary_verts(
-                [[-1.0, -0.85], [1.0, -0.85]]
-                    .map(|p| {
-                        (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
-                            * AREA_SIZE as f32
-                            / 2.0
-                    })
-                    .to_vec(),
-            )
-            .edges(vec![[0, 1]])
+            .edge_map(SpatialEdgeHash::new(
+                40.0,
+                vec![[[-1.0, -0.85], [1.0, -0.85]].map(|p| {
+                    (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0)) * AREA_SIZE as f32
+                        / 2.0
+                })],
+            ))
             .network_parameters(crate::network_generation_component::NetworkDetails {
                 edge_orthogonality_lerp_factor: 0.0,
                 branch_length_factor: 0.5,
@@ -649,7 +627,7 @@ mod test {
 
         let test_point = Vector3::new(89.0, 426.0, 0.0);
 
-        let (experimental, edge) = network.eval_sdf_field(test_point);
+        let (experimental, edge) = network.edge_map.eval_sdf_field(test_point).unwrap();
         let real = 387.6;
         assert!(
             (experimental - real).abs() < 0.001,
@@ -664,16 +642,18 @@ mod test {
     fn sdf_test_two_edges() {
         let network = NetworkGenerationComponent::builder()
             .rng(rng())
-            .boundary_verts(
-                [[-1.0, -0.85], [1.0, -0.85], [1.0, 0.85], [-1.0, 0.85]]
-                    .map(|p| {
-                        (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
-                            * AREA_SIZE as f32
-                            / 2.0
+            .edge_map(SpatialEdgeHash::new(
+                40.0,
+                [[[-1.0, -0.85], [1.0, -0.85]], [[1.0, 0.85], [-1.0, 0.85]]]
+                    .map(|raw_edge| {
+                        raw_edge.map(|p| {
+                            (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
+                                * AREA_SIZE as f32
+                                / 2.0
+                        })
                     })
                     .to_vec(),
-            )
-            .edges(vec![[0, 1], [2, 3]])
+            ))
             .network_parameters(crate::network_generation_component::NetworkDetails {
                 edge_orthogonality_lerp_factor: 0.0,
                 branch_length_factor: 0.5,
@@ -684,7 +664,7 @@ mod test {
             .max_iter_count(0)
             .build();
         let test_point = Vector3::new(89.0, 426.0, 0.0);
-        let (experimental, edge) = network.eval_sdf_field(test_point);
+        let (experimental, edge) = network.edge_map.eval_sdf_field(test_point).unwrap();
         let real = 47.6;
         assert!(
             (experimental - real).abs() < 0.001,
@@ -693,36 +673,5 @@ mod test {
         assert_eq!(edge, 1);
         let gradient = network.sdf_field_gradient(test_point, 0.01);
         assert!(points_are_close(gradient, Vector3::new(0.0, 1.0, 0.0)));
-    }
-
-    #[test]
-    fn simple_edge_split() {
-        let mut network = NetworkGenerationComponent::builder()
-            .rng(rng())
-            .boundary_verts(
-                [[-1.0, -0.85], [1.0, -0.85]]
-                    .map(|p| {
-                        (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
-                            * AREA_SIZE as f32
-                            / 2.0
-                    })
-                    .to_vec(),
-            )
-            .edges(vec![[0, 1]])
-            .network_parameters(crate::network_generation_component::NetworkDetails {
-                edge_orthogonality_lerp_factor: 0.0,
-                branch_length_factor: 0.5,
-                branch_width_factor: 0.5,
-            })
-            .vessel_edges_component(0)
-            .display_vessel_edges_compute(0)
-            .max_iter_count(0)
-            .build();
-
-        let split_index = network.split_edge_with_new_point(0, Vector3::new(128.0, 19.2, 0.0));
-
-        assert_eq!(split_index, 2);
-        assert_eq!(network.edges.len(), 2);
-        assert_eq!(network.edges, [[0, 2], [1, 2]]);
     }
 }
