@@ -36,15 +36,12 @@ pub struct NetworkGenerationComponent<T> {
     #[default(INIT_PROBE_COUNT)]
     num_probes: usize,
     edge_map: SpatialEdgeHash,
-    // boundary_verts: Vec<Vector3<f32>>,
-    // edges: Vec<[usize; 2]>,
     max_iter_count: usize,
     #[default(0)]
     current_iter: usize,
     network_parameters: NetworkDetails,
     #[default(40.0)]
     vessel_oxygen_transport_distance: f32,
-    // non_edges: HashSet<[usize; 2]>,
     vessel_edges_component: ComponentId,
     display_vessel_edges_compute: ComponentId,
     #[default(vec![Vector3::zeros(); INIT_PROBE_COUNT])]
@@ -217,47 +214,6 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         );
     }
 
-    fn distance_to_edge(&self, edge_index: usize, position: Vector3<f32>) -> OrderedFloat<f32> {
-        let edge = self.edge_map.edge(edge_index);
-        let origin = edge[0];
-        let edge_vector = edge[1] - origin;
-        OrderedFloat(
-            (vector_project(edge_vector, position - origin) - (position - origin)).norm_squared(),
-        )
-    }
-
-    /* /// Splits an existing edge at a point, unless the point is too close to an endpoint of the
-    /// edge to warrant a split. Returns the index of the split point in the `boundary_verts` vector
-    fn split_edge_with_new_point(&mut self, edge_index: usize, new_point: Vector3<f32>) -> usize {
-        self.edge_map.split_edge_at_point(edge_index, new_point);
-        let edge_indices = self.edges[edge];
-        let edge_points = edge_indices.map(|i| self.boundary_verts[i]);
-        if let Some((i, _)) = edge_points
-            .into_iter()
-            .enumerate()
-            .filter(|(_, point)| {
-                let res = points_are_close(*point, new_point);
-                res
-            })
-            .next()
-        {
-            return edge_indices[i];
-        }
-
-        let new_point_index = self.boundary_verts.len();
-        self.boundary_verts.push(new_point);
-        self.edges[edge] = [
-            edge_indices[0].min(new_point_index),
-            edge_indices[0].max(new_point_index),
-        ];
-        self.edges.push([
-            edge_indices[1].min(new_point_index),
-            edge_indices[1].max(new_point_index),
-        ]);
-
-        new_point_index
-    } */
-
     fn calc_saturation_at_point(point: Vector3<f32>, edges: &[Edge], oxygen_distance: f32) -> f32 {
         edges
             .iter()
@@ -309,35 +265,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             .map(|edge_index| self.edge_map.edge(edge_index))
             .collect();
 
-        (0..=(sweep_subdivisions + 1))
-            .flat_map(|first_sweep_index| {
-                let first_sweep_pos = lerp(
-                    edges[0][0],
-                    edges[0][1],
-                    first_sweep_index as f32 / (sweep_subdivisions as f32 + 1.0),
-                );
-                (0..=sweep_subdivisions + 1)
-                    .map(|second_sweep_index| {
-                        let second_sweep_pos = lerp(
-                            edges[1][0],
-                            edges[1][1],
-                            second_sweep_index as f32 / (sweep_subdivisions as f32 + 1.0),
-                        );
-                        [first_sweep_pos, second_sweep_pos]
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .min_by_key(|current_edge| {
-                (OrderedFloat(Self::calc_saturation_along_edge(
-                    *current_edge,
-                    saturation_subdivisions,
-                    &nearby_edges,
-                    self.vessel_oxygen_transport_distance,
-                )),)
-            })
-            .unwrap()
-
-        /* let (_, res) = async_scoped::TokioScope::scope_and_block(|scope| {
+        let (_, res) = async_scoped::TokioScope::scope_and_block(|scope| {
             for current_edge in (0..=(sweep_subdivisions + 1)).flat_map(|first_sweep_index| {
                 let first_sweep_pos = lerp(
                     edges[0][0],
@@ -355,13 +283,14 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                     })
                     .collect::<Vec<_>>()
             }) {
+                let nearby_edges = &nearby_edges;
                 let oxygen_distance = self.vessel_oxygen_transport_distance;
                 scope.spawn(async move {
                     (
                         OrderedFloat(Self::calc_saturation_along_edge(
                             current_edge,
                             saturation_subdivisions,
-                            &nearby_edges,
+                            nearby_edges,
                             oxygen_distance,
                         )),
                         current_edge,
@@ -374,7 +303,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             .flatten()
             .min_by_key(|(dist, _)| *dist)
             .unwrap()
-            .1 */
+            .1
     }
 
     /// Takes a straight edge and creates a branch within it.
@@ -385,6 +314,9 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         let edge_center = (edge[0] + edge[1]) / 2.0;
 
         let (sdf_distance_at_edge_center, _) = self.edge_map.eval_sdf_field(edge_center).unwrap();
+
+        let sdf_distance_at_edge_center = sdf_distance_at_edge_center
+            .min(self.edge_map.eval_barrier_sdf_field(edge_center).unwrap());
 
         for edge_point in edge {
             let main_dir = (edge_center - edge_point).normalize();
@@ -430,33 +362,19 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             ..
         }: UpdateParams<'_, '_>,
     ) -> ActionQueue {
-        /* println!(
-            "Occupied: {}, verts: {}",
-            self.edge_map.occupied_cells(),
-            self.edge_map.verts().len()
-        ); */
         self.show_gizmo(other_components, engine_details, device, queue);
 
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
         }
 
-        println!("Iter: {}", self.current_iter);
+        // println!("Iter: {}", self.current_iter);
 
         let target_oxygen_probe = *self
             .probes
             .iter()
             .max_by_key(|&&position| {
                 OrderedFloat(self.edge_map.eval_sdf_field(position).unwrap().0)
-                /* let closest_edge = self
-                    .edge_map
-                    .edges_in_cells_near_point(position)
-                    .into_iter()
-                    .min_by_key(|&edge_vertex_indices| {
-                        self.distance_to_edge(edge_vertex_indices, position)
-                    })
-                    .unwrap();
-                self.distance_to_edge(closest_edge, position) */
             })
             .unwrap();
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
@@ -474,7 +392,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             [first_edge_index, second_edge_index].map(|edge_index| self.edge_map.edge(edge_index)),
             NonZeroU32::new(10).unwrap(),
         );
-        println!("Ox time: {}", a.elapsed().as_millis());
+        // println!("Ox time: {}", a.elapsed().as_millis());
 
         let new_edge_points = [0, 1].map(|i| {
             lerp(
@@ -492,9 +410,10 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
-
-        self.edge_map.split_edge_at_point(first_edge_index, new_edge_points[0]);
-        self.edge_map.split_edge_at_point(second_edge_index, new_edge_points[1]);
+        self.edge_map
+            .split_edge_at_point(first_edge_index, new_edge_points[0]);
+        self.edge_map
+            .split_edge_at_point(second_edge_index, new_edge_points[1]);
 
         self.bifurcate_edge(
             new_edge_points,

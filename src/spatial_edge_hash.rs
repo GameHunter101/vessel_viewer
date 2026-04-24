@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use nalgebra::Vector3;
+use egui::emath::OrderedFloat;
+use nalgebra::{Vector2, Vector3};
 
 use crate::network_generation_component::points_are_close;
 
@@ -8,10 +9,10 @@ pub type Edge = [Vector3<f32>; 2];
 
 #[derive(Debug, Clone)]
 pub struct SpatialEdgeHash {
-    // edges: Vec<[usize; 2]>,
     map: HashMap<Vector3<u32>, HashSet<usize>>,
     verts: Vec<Vector3<f32>>,
     edge_indices: Vec<[usize; 2]>,
+    barrier_edges: Vec<Edge>,
     cell_size: f32,
 }
 
@@ -21,6 +22,13 @@ impl SpatialEdgeHash {
             map: HashMap::new(),
             verts: Vec::new(),
             edge_indices: Vec::new(),
+            barrier_edges: vec![
+                [Vector3::zeros(), Vector3::new(0.0, 512.0, 0.0)],
+                [
+                    Vector3::new(512.0, 0.0, 0.0),
+                    Vector3::new(512.0, 512.0, 0.0),
+                ],
+            ],
             cell_size: spatial_subdivision,
         };
         for edge in edges {
@@ -35,47 +43,59 @@ impl SpatialEdgeHash {
         scaled.map(|v| v as u32).into()
     }
 
+    /// Calculates the parameter `t` for which the ray exits the "slab". A slab is a set of two
+    /// parallel sides of the cube. [https://www.cs.cornell.edu/courses/cs4620/2013fa/lectures/03raytracing1.pdf]
+    fn cube_slab_ray_exit(&self, ray: [Vector2<f32>; 2]) -> f32 {
+        let d = ray[1] - ray[0];
+        let a = ray[0];
+
+        let t_x_min = nan_to_inf(-a.x / d.x);
+        let t_x_max = nan_to_inf((self.cell_size - a.x) / d.x);
+        let t_x_exit = t_x_min.max(t_x_max);
+
+        let t_y_min = nan_to_inf(-a.y / d.y);
+        let t_y_max = nan_to_inf((self.cell_size - a.y) / d.y);
+        let t_y_exit = t_y_min.max(t_y_max);
+
+        t_x_exit.min(t_y_exit)
+    }
+
+    fn cube_ray_intersection(&self, ray: Edge) -> Vector3<f32> {
+        let t = [[0, 1], [1, 2], [0, 2]]
+            .map(|[comp_1, comp_2]| {
+                let current_ray = ray.map(|point| Vector2::new(point[comp_1], point[comp_2]));
+                self.cube_slab_ray_exit(current_ray)
+            })
+            .into_iter()
+            .min_by_key(|x| egui::emath::OrderedFloat(*x))
+            .unwrap();
+
+        ray[0] + t * (ray[1] - ray[0])
+    }
+
     /// Detects which grid cells the edge intersects, updates cells with new edge.
     /// Algorithm adapted from [http://www.cse.yorku.ca/~amana/research/grid.pdf]
-    fn find_cells_along_edge(&self, mut edge: Edge) -> HashSet<Vector3<u32>> {
+    fn find_cells_along_edge(&self, edge: Edge) -> HashSet<Vector3<u32>> {
         let mut edge_cells: HashSet<Vector3<u32>> = HashSet::new();
         let mut ray_point = edge[0];
-        let mut edge_dir = (edge[1] - edge[0]).normalize();
         while !points_are_close(ray_point, edge[1]) {
             let grid_point = self.floor_point_to_grid(ray_point);
             edge_cells.insert(grid_point);
-            // ray_point.x + t_delta_x * edge_dir.x = (grid_point.x + 1.0) * self.cell_size
-            let t_delta_x = nan_to_inf(
-                ((grid_point.x as f32 + 1.0) * self.cell_size - ray_point.x) / edge_dir.x,
-            );
-            let t_delta_y = nan_to_inf(
-                ((grid_point.y as f32 + 1.0) * self.cell_size - ray_point.y) / edge_dir.y,
-            );
-            let t_delta_z = nan_to_inf(
-                ((grid_point.z as f32 + 1.0) * self.cell_size - ray_point.z) / edge_dir.z,
-            );
 
-            let t_delta_min = if t_delta_x.abs() < t_delta_y.abs() {
-                if t_delta_x.abs() < t_delta_z.abs() {
-                    t_delta_x
-                } else {
-                    t_delta_z
-                }
-            } else if t_delta_y.abs() < t_delta_z.abs() {
-                t_delta_y
-            } else {
-                t_delta_z
-            };
-            // t_delta_x.min(t_delta_y.min(t_delta_z));
+            let cell_origin = self.cell_size
+                * Vector3::new(
+                    grid_point.x as f32,
+                    grid_point.y as f32,
+                    grid_point.z as f32,
+                );
 
-            if t_delta_min < 0.0 {
-                edge = [edge[1], edge[0]];
-                ray_point = edge[0];
-                edge_dir = (edge[1] - edge[0]).normalize();
-                continue;
-            }
+            let intersection_point = self
+                .cube_ray_intersection([ray_point - cell_origin, edge[1] - cell_origin])
+                + cell_origin;
 
-            ray_point = clamp_vector_on_edge(ray_point + t_delta_min * edge_dir, edge);
+            // Introduce minor relaxation factor to nudge points off of cell boundaries
+            ray_point =
+                clamp_vector_on_edge(intersection_point + 0.001 * (edge[1] - edge[0]), edge);
         }
 
         edge_cells.insert(self.floor_point_to_grid(edge[1]));
@@ -103,38 +123,10 @@ impl SpatialEdgeHash {
         }
     }
 
-    /* pub fn remove_edge(&mut self, edge: Edge, edge_index: usize) {
-        let cells_to_modify = self.find_cells_along_edge(edge);
-        for cell in cells_to_modify {
-            if let Some(edges_in_cell) = self.map.get_mut(&cell) {
-                edges_in_cell.remove(&edge_index);
-                if edges_in_cell.is_empty() {
-                    self.map.remove(&cell);
-                }
-            }
-        }
-
-        /* if let Some(edge_remainder) = self.edge_remainder_after_deletion(edge_index, edge) {
-            self.edge_vertices[edge_index] = edge_remainder;
-            for vert in edge_remainder {
-                let vert_cell = self.floor_point_to_grid(vert);
-                if let Some(edges_in_cell) = self.map.get_mut(&vert_cell) {
-                    edges_in_cell.insert(edge_index);
-                } else {
-                    self.map.insert(vert_cell, HashSet::from_iter([edge_index]));
-                }
-            }
-        } else {
-            self.edges.remove(edge_index);
-        } */
-    } */
-
     /// Takes an edge `edge_index` and splits it up into two new edges at `point`. Does nothing if
     /// `point` is near any of `edge_index`'s endpoints. Performs the operation by truncating the
     /// original edge to its new length, and creating a new edge to fill in the remaining endpoints.
     pub fn split_edge_at_point(&mut self, edge_index: usize, point: Vector3<f32>) {
-        let edge_cells = self.find_cells_along_edge(self.edge(edge_index));
-
         let edge_indices = self.edge_indices[edge_index];
         if edge_indices
             .iter()
@@ -148,15 +140,6 @@ impl SpatialEdgeHash {
             let split_edge = [point, self.verts[endpoint_index]];
             self.find_cells_along_edge(split_edge)
         });
-
-        // println!("Edge: {:?}", self.edge(edge_index));
-        /* assert_eq!(
-            edge_cells,
-            cells_of_splits[0]
-                .clone()
-                .union(&cells_of_splits[1].clone()).copied()
-                .collect::<HashSet<Vector3<u32>>>()
-        ); */
 
         for cell in cells_of_splits[1].difference(&cells_of_splits[0]) {
             self.map
@@ -203,9 +186,8 @@ impl SpatialEdgeHash {
     }
 
     /// The SDF function for an edge defined by two points.
-    /// Sourced from https://iquilezles.org/articles/distfunctions2d/
-    fn edge_sdf(&self, edge_index: usize, point: Vector3<f32>) -> f32 {
-        let [a, b] = self.edge(edge_index);
+    /// Sourced from [https://iquilezles.org/articles/distfunctions2d/]
+    fn edge_sdf([a, b]: Edge, point: Vector3<f32>) -> f32 {
         let pa = point - a;
         let ba = b - a;
         let h = (pa.dot(&ba) / ba.dot(&ba)).clamp(0.0, 1.0);
@@ -226,7 +208,7 @@ impl SpatialEdgeHash {
         for (_, edge_indices) in cells_sorted_by_distance {
             if let Some(min_edge) = edge_indices
                 .into_iter()
-                .map(|edge_index| (self.edge_sdf(edge_index, point), edge_index))
+                .map(|edge_index| (Self::edge_sdf(self.edge(edge_index), point), edge_index))
                 .min_by_key(|(dist, _)| egui::emath::OrderedFloat(*dist))
             {
                 return Some(min_edge);
@@ -234,6 +216,13 @@ impl SpatialEdgeHash {
         }
 
         None
+    }
+
+    pub fn eval_barrier_sdf_field(&self, point: Vector3<f32>) -> Option<f32> {
+        self.barrier_edges
+            .iter()
+            .map(|edge| Self::edge_sdf(*edge, point))
+            .min_by_key(|&x| OrderedFloat(x))
     }
 
     /// Returns the index corresponding to a vertex if it is in the map
@@ -406,5 +395,154 @@ mod test {
                 (Vector3::new(2, 2, 0), set![1]),
             ])
         );
+    }
+
+    // Autogenerated tests by ChatGPT
+
+    fn approx_eq(a: Vector3<f32>, b: Vector3<f32>) -> bool {
+        let eps = 1e-5;
+        (a - b).abs().max() < eps
+    }
+
+    fn is_on_cube_surface(p: Vector3<f32>, cell: f32) -> bool {
+        let eps = 1e-5;
+
+        let in_bounds = |x: f32| x >= -eps && x <= cell + eps;
+        let on_face = |x: f32| x.abs() < eps || (x - cell).abs() < eps;
+
+        in_bounds(p.x)
+            && in_bounds(p.y)
+            && in_bounds(p.z)
+            && (on_face(p.x) || on_face(p.y) || on_face(p.z))
+    }
+
+    fn make_edge(a: [f32; 3], b: [f32; 3]) -> super::Edge {
+        [Vector3::from(a), Vector3::from(b)]
+    }
+
+    #[test]
+    fn axis_aligned_positive_x() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.5, 0.5, 0.5], [2.0, 0.5, 0.5]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(cell, 0.5, 0.5)));
+    }
+
+    #[test]
+    fn axis_aligned_negative_x() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.5, 0.5, 0.5], [-1.0, 0.5, 0.5]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(0.0, 0.5, 0.5)));
+    }
+
+    #[test]
+    fn axis_aligned_positive_y() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.2, 0.3, 0.4], [0.2, 2.0, 0.4]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(0.2, cell, 0.4)));
+    }
+
+    #[test]
+    fn axis_aligned_positive_z() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.2, 0.3, 0.4], [0.2, 0.3, 2.0]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(0.2, 0.3, cell)));
+    }
+
+    #[test]
+    fn diagonal_hits_corner() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.5, 0.5, 0.5], [2.0, 2.0, 2.0]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(cell, cell, cell)));
+    }
+
+    #[test]
+    fn diagonal_hits_edge() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.5, 0.5, 0.5], [2.0, 2.0, 0.5]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(cell, cell, 0.5)));
+    }
+
+    #[test]
+    fn arbitrary_direction() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.3, 0.4, 0.5], [1.5, 0.6, 0.7]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(is_on_cube_surface(hit, cell));
+    }
+
+    #[test]
+    fn very_close_to_face() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.9999, 0.5, 0.5], [2.0, 0.5, 0.5]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(cell, 0.5, 0.5)));
+    }
+
+    #[test]
+    fn starting_near_corner() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let ray = make_edge([0.001, 0.001, 0.001], [-1.0, -1.0, -1.0]);
+        let hit = cube.cube_ray_intersection(ray);
+
+        assert!(approx_eq(hit, Vector3::new(0.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn random_directions_stay_on_surface() {
+        let cell = 1.0;
+        let cube = SpatialEdgeHash::new(cell, Vec::new());
+
+        let origins = [[0.5, 0.5, 0.5], [0.2, 0.7, 0.3], [0.8, 0.1, 0.9]];
+
+        let dirs = [
+            [1.0, 0.3, 0.2],
+            [-0.5, 1.0, 0.1],
+            [0.2, -0.3, 1.0],
+            [-1.0, -1.0, -1.0],
+        ];
+
+        for o in origins.iter() {
+            for d in dirs.iter() {
+                let start = Vector3::from(*o);
+                let end = start + Vector3::from(*d);
+
+                let ray = [start, end];
+                let hit = cube.cube_ray_intersection(ray);
+
+                assert!(is_on_cube_surface(hit, cell));
+            }
+        }
     }
 }
