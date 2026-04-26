@@ -1,4 +1,4 @@
-const SIZE = 512u;
+const SIZE = 1024u;
 @group(0) @binding(0) var<uniform> vessel_edges: array<VesselEdge, SIZE>;
 
 @group(0) @binding(1) var oxygen_concentration: texture_storage_2d<rgba32float, read_write>;

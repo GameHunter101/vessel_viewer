@@ -160,6 +160,31 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         (distance, closest_edge, pos)
     }
 
+    fn raycast_barrier_in_dir(
+        &self,
+        origin: Vector3<f32>,
+        dir: Vector3<f32>,
+        max_dist: f32,
+        max_iter_count: u32,
+        min_dist: f32,
+    ) -> f32 {
+        let mut pos = origin;
+        let mut distance = 0.0;
+        for _ in 0..max_iter_count {
+            if distance >= max_dist {
+                break;
+            }
+            let next_distance = self.edge_map.eval_barrier_sdf_field(pos).unwrap();
+            pos += dir * next_distance;
+            distance += next_distance;
+            if next_distance < min_dist {
+                break;
+            }
+        }
+
+        distance
+    }
+
     /// Displays a line at the cursor in the direction of the sdf field with proper magnitude
     fn show_gizmo(
         &self,
@@ -328,9 +353,23 @@ impl<T: Rng> NetworkGenerationComponent<T> {
 
             for apex_point in branch_apex_points {
                 self.edge_map.insert_edge([branch_point, apex_point]);
+                /* println!(
+                    "New edge: {:?}",
+                    [
+                        (branch_point.x, branch_point.y),
+                        (apex_point.x, apex_point.y)
+                    ]
+                ); */
             }
 
             self.edge_map.insert_edge([edge_point, branch_point]);
+            /* println!(
+                "New edge: {:?}",
+                [
+                    (edge_point.x, edge_point.y),
+                    (branch_point.x, branch_point.y)
+                ]
+            ); */
         }
     }
 }
@@ -340,10 +379,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 {
     fn initialize(&mut self, _device: &Device) -> ActionQueue {
         self.distribute_probes();
-        println!(
-            "{:?}",
-            self.probes.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()
-        );
         self.set_initialized();
         vec![Box::new(RegisterUiComponentAction {
             component_id: self.id,
@@ -368,31 +403,42 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
-        // println!("Iter: {}", self.current_iter);
-
-        let target_oxygen_probe = *self
+        let (probe_index, target_oxygen_probe) = self
             .probes
             .iter()
-            .max_by_key(|&&position| {
-                OrderedFloat(self.edge_map.eval_sdf_field(position).unwrap().0)
+            .enumerate()
+            .max_by_key(|(_, position)| {
+                OrderedFloat(self.edge_map.eval_sdf_field(**position).unwrap().0)
             })
+            .map(|(idx, probe)| (idx, *probe))
             .unwrap();
+
         let sdf_gradient = self.sdf_field_gradient(target_oxygen_probe, 0.01);
 
-        let (_, first_edge_index, first_raycast_pos) =
+        let (first_ray_distance, first_edge_index, first_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01);
-        let (_, second_edge_index, second_raycast_pos) =
+        let (second_ray_distance, second_edge_index, second_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
         let raycast_edges = [first_raycast_pos, second_raycast_pos];
-
-        let a = std::time::Instant::now();
+        if first_ray_distance
+            > self.raycast_barrier_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01)
+            || second_ray_distance
+                > self.raycast_barrier_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01)
+        {
+            self.probes.remove(probe_index);
+            return Vec::new();
+        }
+        println!(
+            "First raycast: {:?}, second raycast: {:?}",
+            (first_raycast_pos.x, first_raycast_pos.y),
+            (second_raycast_pos.x, second_raycast_pos.y)
+        );
 
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
             [first_edge_index, second_edge_index].map(|edge_index| self.edge_map.edge(edge_index)),
             NonZeroU32::new(10).unwrap(),
         );
-        // println!("Ox time: {}", a.elapsed().as_millis());
 
         let new_edge_points = [0, 1].map(|i| {
             lerp(
@@ -592,5 +638,41 @@ mod test {
         assert_eq!(edge, 1);
         let gradient = network.sdf_field_gradient(test_point, 0.01);
         assert!(points_are_close(gradient, Vector3::new(0.0, 1.0, 0.0)));
+    }
+
+    #[test]
+    fn sdf_test_odd_edge_case() {
+        let network = NetworkGenerationComponent::builder()
+            .rng(rng())
+            .edge_map(SpatialEdgeHash::new(
+                50.0,
+                [[[-1.0, -0.85], [1.0, -0.85]], [[1.0, 0.85], [-1.0, 0.85]]]
+                    .map(|raw_edge| {
+                        raw_edge.map(|p| {
+                            (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0))
+                                * AREA_SIZE as f32
+                                / 2.0
+                        })
+                    })
+                    .to_vec(),
+            ))
+            .network_parameters(crate::network_generation_component::NetworkDetails {
+                edge_orthogonality_lerp_factor: 0.0,
+                branch_length_factor: 0.5,
+                branch_width_factor: 0.5,
+            })
+            .vessel_edges_component(0)
+            .display_vessel_edges_compute(0)
+            .max_iter_count(0)
+            .build();
+
+        let test_point = Vector3::new(460.8, 212.6, 0.0);
+        let (experimental, edge) = network.edge_map.eval_sdf_field(test_point).unwrap();
+        let real = 174.2;
+        assert!(
+            (experimental - real).abs() < 0.001,
+            "Expected sdf value {experimental} to equal {real}"
+        );
+        assert_eq!(edge, 0);
     }
 }
