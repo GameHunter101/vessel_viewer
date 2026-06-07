@@ -167,22 +167,24 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         max_dist: f32,
         max_iter_count: u32,
         min_dist: f32,
-    ) -> f32 {
+    ) -> (usize, f32) {
         let mut pos = origin;
         let mut distance = 0.0;
+        let mut closest_barrier = 0;
         for _ in 0..max_iter_count {
             if distance >= max_dist {
                 break;
             }
-            let next_distance = self.edge_map.eval_barrier_sdf_field(pos).unwrap();
+            let (next_barrier, next_distance) = self.edge_map.eval_barrier_sdf_field(pos).unwrap();
             pos += dir * next_distance;
             distance += next_distance;
+            closest_barrier = next_barrier;
             if next_distance < min_dist {
                 break;
             }
         }
 
-        distance
+        (closest_barrier, distance)
     }
 
     /// Displays a line at the cursor in the direction of the sdf field with proper magnitude
@@ -341,7 +343,7 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         let (sdf_distance_at_edge_center, _) = self.edge_map.eval_sdf_field(edge_center).unwrap();
 
         let sdf_distance_at_edge_center = sdf_distance_at_edge_center
-            .min(self.edge_map.eval_barrier_sdf_field(edge_center).unwrap());
+            .min(self.edge_map.eval_barrier_sdf_field(edge_center).unwrap().1);
 
         for edge_point in edge {
             let main_dir = (edge_center - edge_point).normalize();
@@ -353,23 +355,9 @@ impl<T: Rng> NetworkGenerationComponent<T> {
 
             for apex_point in branch_apex_points {
                 self.edge_map.insert_edge([branch_point, apex_point]);
-                /* println!(
-                    "New edge: {:?}",
-                    [
-                        (branch_point.x, branch_point.y),
-                        (apex_point.x, apex_point.y)
-                    ]
-                ); */
             }
 
             self.edge_map.insert_edge([edge_point, branch_point]);
-            /* println!(
-                "New edge: {:?}",
-                [
-                    (edge_point.x, edge_point.y),
-                    (branch_point.x, branch_point.y)
-                ]
-            ); */
         }
     }
 }
@@ -403,6 +391,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
+        let a = std::time::Instant::now();
         let (probe_index, target_oxygen_probe) = self
             .probes
             .iter()
@@ -420,25 +409,48 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         let (second_ray_distance, second_edge_index, second_raycast_pos) =
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
         let raycast_edges = [first_raycast_pos, second_raycast_pos];
-        if first_ray_distance
-            > self.raycast_barrier_in_dir(target_oxygen_probe, sdf_gradient, 1000.0, 50, 0.01)
-            || second_ray_distance
-                > self.raycast_barrier_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01)
-        {
-            self.probes.remove(probe_index);
-            return Vec::new();
-        }
-        println!(
-            "First raycast: {:?}, second raycast: {:?}",
-            (first_raycast_pos.x, first_raycast_pos.y),
-            (second_raycast_pos.x, second_raycast_pos.y)
-        );
+
+        let [
+            (first_barrier_intersection_edge, first_barrier_distance),
+            (second_barrier_intersection_edge, second_barrier_distance),
+        ] = [1.0, -1.0].map(|c| {
+            self.raycast_barrier_in_dir(target_oxygen_probe, c * sdf_gradient, 1000.0, 50, 0.01)
+        });
+
+        let first_edge = if first_ray_distance > first_barrier_distance {
+            let barrier_edge = self.edge_map.barrier_edges()[first_barrier_intersection_edge];
+            let intersection_point = target_oxygen_probe + first_barrier_distance * sdf_gradient;
+            if barrier_edge[0].metric_distance(&intersection_point)
+                < barrier_edge[1].metric_distance(&intersection_point)
+            {
+                [barrier_edge[0]; 2]
+            } else {
+                [barrier_edge[1]; 2]
+            }
+        } else {
+            self.edge_map.edge(first_edge_index)
+        };
+
+        let second_edge = if second_ray_distance > second_barrier_distance {
+            let barrier_edge = self.edge_map.barrier_edges()[second_barrier_intersection_edge];
+            let intersection_point = target_oxygen_probe - second_barrier_distance * sdf_gradient;
+            if barrier_edge[0].metric_distance(&intersection_point)
+                < barrier_edge[1].metric_distance(&intersection_point)
+            {
+                [barrier_edge[0]; 2]
+            } else {
+                [barrier_edge[1]; 2]
+            }
+        } else {
+            self.edge_map.edge(second_edge_index)
+        };
 
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
-            [first_edge_index, second_edge_index].map(|edge_index| self.edge_map.edge(edge_index)),
+            [first_edge, second_edge],
             NonZeroU32::new(10).unwrap(),
         );
+        println!("Ox time: {}", a.elapsed().as_millis());
 
         let new_edge_points = [0, 1].map(|i| {
             lerp(
@@ -448,18 +460,25 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             )
         });
 
-        // TODO: Temporary barrier detection, replace with more elegant detection and edge redirection
+        /* // TODO: Temporary barrier detection, replace with more elegant detection and edge redirection
         if (new_edge_points[0].x > AREA_SIZE as f32 || new_edge_points[0].x < 0.0)
             || (new_edge_points[1].x > AREA_SIZE as f32 || new_edge_points[1].x < 0.0)
         {
             self.distribute_probes();
             return Vec::new();
+        } */
+
+        if first_edge[0] != first_edge[1] {
+            println!("Edge: {first_edge:?}, split: {:?}", new_edge_points[0]);
+            self.edge_map
+                .split_edge_at_point(first_edge_index, new_edge_points[0]);
         }
 
-        self.edge_map
-            .split_edge_at_point(first_edge_index, new_edge_points[0]);
-        self.edge_map
-            .split_edge_at_point(second_edge_index, new_edge_points[1]);
+        if second_edge[0] != second_edge[1] {
+            println!("Edge: {second_edge:?}, split: {:?}", new_edge_points[1]);
+            self.edge_map
+                .split_edge_at_point(second_edge_index, new_edge_points[1]);
+        }
 
         self.bifurcate_edge(
             new_edge_points,
@@ -490,10 +509,10 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         self.num_probes += 1;
         self.distribute_probes();
 
-        println!(
+        /* println!(
             "frame time: {}",
             engine_details.last_frame_instant.elapsed().as_millis()
-        );
+        ); */
 
         Vec::new()
     }

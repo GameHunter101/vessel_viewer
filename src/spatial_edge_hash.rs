@@ -268,11 +268,12 @@ impl SpatialEdgeHash {
         None
     }
 
-    pub fn eval_barrier_sdf_field(&self, point: Vector3<f32>) -> Option<f32> {
+    pub fn eval_barrier_sdf_field(&self, point: Vector3<f32>) -> Option<(usize, f32)> {
         self.barrier_edges
             .iter()
-            .map(|edge| Self::edge_sdf(*edge, point))
-            .min_by_key(|&x| OrderedFloat(x))
+            .enumerate()
+            .map(|(edge_index, edge)| (edge_index, Self::edge_sdf(*edge, point)))
+            .min_by_key(|(_, x)| OrderedFloat(*x))
     }
 
     /// Returns the index corresponding to a vertex if it is in the map
@@ -324,6 +325,10 @@ impl SpatialEdgeHash {
 
     pub fn occupied_cells(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn barrier_edges(&self) -> &[Edge] {
+        &self.barrier_edges
     }
 }
 

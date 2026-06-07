@@ -1,4 +1,4 @@
-const BUFFER_SIZE: usize = 1024;
+const BUFFER_SIZE: usize = 2048;
 const AREA_SIZE: usize = 512;
 
 use image::EncodableLayout;
@@ -130,10 +130,10 @@ async fn main() {
                     max_iter_count: 1,
                     network_parameters: NetworkDetails {
                         edge_orthogonality_lerp_factor: 0.0,
-                        branch_width_factor: 0.6,
-                        branch_length_factor: 0.55,
-                        /* branch_width_factor: 0.3,
-                        branch_length_factor: 0.7, */
+                        /* branch_width_factor: 0.6,
+                        branch_length_factor: 0.55, */
+                        branch_width_factor: 0.3,
+                        branch_length_factor: 0.7,
                     },
                     vessel_edges_component: ident("vessel_edges"),
                     display_vessel_edges_compute: ident("vessel_compute"),
