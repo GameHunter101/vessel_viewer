@@ -6,7 +6,7 @@ use nalgebra::Vector3;
 use rand::{SeedableRng, rngs::StdRng};
 use v4::{
     V4,
-    builtin_components::mesh_component::{MeshComponent, VertexData, VertexDescriptor},
+    builtin_components::{camera_component::CameraComponent, mesh_component::{MeshComponent, VertexData, VertexDescriptor}},
     ecs::{
         compute::Compute,
         material::{ShaderAttachment, ShaderBufferAttachment, ShaderTextureAttachment},
@@ -90,20 +90,35 @@ async fn main() {
 
     scene! {
         scene: vessel_viewer,
+        /* active_camera: "cam_comp",
+        "cam" = {
+            components: [
+                CameraComponent(field_of_view: 60.0, aspect_ratio: 1.0, near_plane: 0.01, far_plane: 1024.0, sensitivity: 0.02, movement_speed: 0.1, ident: "cam_comp")
+            ]
+        }, */
         "oxygen_concentration" = {
             material: {
                 pipeline: {
                     vertex_shader_path: "shaders/oxygen_display_vertex.wgsl",
-                    fragment_shader_path: "shaders/oxygen_display_fragment.wgsl",
+                    // fragment_shader_path: "shaders/oxygen_display_fragment.wgsl",
+                    fragment_shader_path: "shaders/sdf_fragment.wgsl",
                     uses_camera: false,
                     vertex_layouts: [DisplayVertex::vertex_layout()],
                 },
                 attachments: [
-                    Texture(
+                    /* Texture(
                         texture_bundle: oxygen_concentration_display_texture_bundle,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                    ) */
+                    Buffer(
+                        device: device,
+                        data: bytemuck::cast_slice(&oxygen_compute_edges),
+                        buffer_type: wgpu::BufferBindingType::Uniform,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     )
-                ]
+                ],
+                ident: "sdf_mat"
             },
             components: [
                 MeshComponent(
@@ -136,10 +151,11 @@ async fn main() {
                         branch_length_factor: 0.7,
                     },
                     vessel_edges_component: ident("vessel_edges"),
-                    display_vessel_edges_compute: ident("vessel_compute"),
+                    vessel_sdf_material: ident("sdf_mat")
+                    // display_vessel_edges_compute: ident("vessel_compute"),
                 )
             ],
-            computes: [Compute(
+            /* computes: [Compute(
                     attachments: vec![
                         ShaderAttachment::Buffer(ShaderBufferAttachment::new(
                             device,
@@ -156,7 +172,7 @@ async fn main() {
                 shader_path: "shaders/oxygen_compute.wgsl",
                 workgroup_counts: v4::ecs::compute::WorkgroupCounts::Static(512, 512, 1),
                 ident: "vessel_compute"
-            )],
+            )], */
         },
         "vessels" = {
             material: {
@@ -246,23 +262,33 @@ impl VertexDescriptor for DisplayVertex {
 }
 
 pub fn initialize_points() -> (Vec<Vertex>, Vec<Edge>) {
+    let top_right = [0.75, 0.85, 0.0];
+
     let vessels = vec![
         Vertex {
-            pos: [-1.0, -0.85, 0.0],
+            pos: [-top_right[0], -top_right[1], 0.0],
             color: [1.0, 0.0, 0.0, 1.0],
         },
         Vertex {
-            pos: [1.0, -0.85, 0.0],
+            pos: [top_right[0], -top_right[1], 0.0],
             color: [1.0, 0.0, 0.0, 1.0],
         },
         Vertex {
-            pos: [1.0, 0.85, 0.0],
+            pos: [top_right[0], top_right[1], 0.0],
             color: [0.0, 0.0, 1.0, 1.0],
         },
         Vertex {
-            pos: [-1.0, 0.85, 0.0],
+            pos: [-top_right[0], top_right[1], 0.0],
             color: [0.0, 0.0, 1.0, 1.0],
         },
+        Vertex {
+            pos: [1.0, 0.0, 0.0],
+            color: [1.0, 0.0, 1.0, 1.0]
+        },
+        Vertex {
+            pos: [-1.0, 0.0, 0.0],
+            color: [1.0, 0.0, 1.0, 1.0]
+        }
     ];
 
     let boundary: Vec<Vector3<f32>> = vessels
@@ -274,6 +300,13 @@ pub fn initialize_points() -> (Vec<Vertex>, Vec<Edge>) {
 
     (
         vessels,
-        vec![[boundary[0], boundary[1]], [boundary[2], boundary[3]]],
+        vec![
+            [boundary[0], boundary[1]],
+            [boundary[2], boundary[3]],
+            [boundary[4], boundary[2]],
+            [boundary[4], boundary[1]],
+            [boundary[5], boundary[0]],
+            [boundary[5], boundary[3]],
+        ],
     )
 }

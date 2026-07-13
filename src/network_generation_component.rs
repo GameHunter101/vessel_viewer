@@ -43,7 +43,8 @@ pub struct NetworkGenerationComponent<T> {
     #[default(40.0)]
     vessel_oxygen_transport_distance: f32,
     vessel_edges_component: ComponentId,
-    display_vessel_edges_compute: ComponentId,
+    // display_vessel_edges_compute: ComponentId,
+    vessel_sdf_material: ComponentId,
     #[default(vec![Vector3::zeros(); INIT_PROBE_COUNT])]
     probes: Vec<Vector3<f32>>,
 }
@@ -93,7 +94,10 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         );
         let edges: Vec<ComputeEdge> = all_edges
             .iter()
-            .map(|edge| ComputeEdge::new([edge[0].x, edge[0].y], [edge[1].x, edge[1].y]))
+            .map(|edge| {
+                let edge = edge.map(|point| (point / (AREA_SIZE as f32 / 2.0) - Vector3::new(1.0, 1.0, 0.0)) / 2.0);
+                ComputeEdge::new([edge[0].x, edge[0].y], [edge[1].x, edge[1].y])
+            })
             .collect();
 
         let edge_count = edges.len();
@@ -381,6 +385,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             device,
             queue,
             computes,
+            materials,
             engine_details,
             ..
         }: UpdateParams<'_, '_>,
@@ -390,6 +395,8 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         if self.current_iter >= self.max_iter_count {
             return Vec::new();
         }
+
+        println!("Iter");
 
         let a = std::time::Instant::now();
         let (probe_index, target_oxygen_probe) = self
@@ -417,7 +424,8 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             self.raycast_barrier_in_dir(target_oxygen_probe, c * sdf_gradient, 1000.0, 50, 0.01)
         });
 
-        let first_edge = if first_ray_distance > first_barrier_distance {
+        let first_edge = self.edge_map.edge(first_edge_index);
+        /* let first_edge = if first_ray_distance > first_barrier_distance {
             let barrier_edge = self.edge_map.barrier_edges()[first_barrier_intersection_edge];
             let intersection_point = target_oxygen_probe + first_barrier_distance * sdf_gradient;
             if barrier_edge[0].metric_distance(&intersection_point)
@@ -429,9 +437,10 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             }
         } else {
             self.edge_map.edge(first_edge_index)
-        };
+        }; */
 
-        let second_edge = if second_ray_distance > second_barrier_distance {
+        let second_edge = self.edge_map.edge(second_edge_index);
+        /* let second_edge = if second_ray_distance > second_barrier_distance {
             let barrier_edge = self.edge_map.barrier_edges()[second_barrier_intersection_edge];
             let intersection_point = target_oxygen_probe - second_barrier_distance * sdf_gradient;
             if barrier_edge[0].metric_distance(&intersection_point)
@@ -443,14 +452,14 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             }
         } else {
             self.edge_map.edge(second_edge_index)
-        };
+        }; */
 
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
             [first_edge, second_edge],
             NonZeroU32::new(10).unwrap(),
         );
-        println!("Ox time: {}", a.elapsed().as_millis());
+        // println!("Ox time: {}", a.elapsed().as_millis());
 
         let new_edge_points = [0, 1].map(|i| {
             lerp(
@@ -469,13 +478,13 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         } */
 
         if first_edge[0] != first_edge[1] {
-            println!("Edge: {first_edge:?}, split: {:?}", new_edge_points[0]);
+            // println!("Edge: {first_edge:?}, split: {:?}", new_edge_points[0]);
             self.edge_map
                 .split_edge_at_point(first_edge_index, new_edge_points[0]);
         }
 
         if second_edge[0] != second_edge[1] {
-            println!("Edge: {second_edge:?}, split: {:?}", new_edge_points[1]);
+            // println!("Edge: {second_edge:?}, split: {:?}", new_edge_points[1]);
             self.edge_map
                 .split_edge_at_point(second_edge_index, new_edge_points[1]);
         }
@@ -489,10 +498,14 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         if let Some(component) = other_components
             .iter_mut()
             .find(|comp| comp.id() == self.vessel_edges_component)
-            && let Some(compute) = computes
+            /* && let Some(compute) = computes
                 .iter_mut()
                 .find(|comp| comp.id() == self.display_vessel_edges_compute)
-            && let ShaderAttachment::Buffer(buf) = &mut compute.attachments_mut()[0]
+            && let ShaderAttachment::Buffer(buf) = &mut compute.attachments_mut()[0] */
+            && let Some(material) = materials
+                .iter_mut()
+                .find(|material| material.id() == self.vessel_sdf_material)
+            && let ShaderAttachment::Buffer(buf) = &mut material.attachments_mut()[0]
         {
             let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
             Self::update_buffers(
@@ -565,8 +578,8 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
     }
 }
 
-fn vector_project(base: Vector3<f32>, target: Vector3<f32>) -> Vector3<f32> {
-    base.dot(&target) / base.norm_squared() * base
+pub fn vector_project(line: Vector3<f32>, point: Vector3<f32>) -> Vector3<f32> {
+    line.dot(&point) / line.norm_squared() * line
 }
 
 fn lerp<T: std::ops::Add<Output = T> + std::ops::Mul<f32, Output = T>>(a: T, b: T, t: f32) -> T {
@@ -605,7 +618,8 @@ mod test {
                 branch_width_factor: 0.5,
             })
             .vessel_edges_component(0)
-            .display_vessel_edges_compute(0)
+            // .display_vessel_edges_compute(0)
+            .vessel_sdf_material(0)
             .max_iter_count(0)
             .build();
 
@@ -644,7 +658,8 @@ mod test {
                 branch_width_factor: 0.5,
             })
             .vessel_edges_component(0)
-            .display_vessel_edges_compute(0)
+            // .display_vessel_edges_compute(0)
+            .vessel_sdf_material(0)
             .max_iter_count(0)
             .build();
         let test_point = Vector3::new(89.0, 426.0, 0.0);
@@ -681,7 +696,8 @@ mod test {
                 branch_width_factor: 0.5,
             })
             .vessel_edges_component(0)
-            .display_vessel_edges_compute(0)
+            // .display_vessel_edges_compute(0)
+            .vessel_sdf_material(0)
             .max_iter_count(0)
             .build();
 
