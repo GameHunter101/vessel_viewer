@@ -146,10 +146,10 @@ impl SpatialEdgeHash {
             self.find_cells_along_edge(split_edge)
         });
 
-        println!("Edge: {edge_vertices:?}, point: {point:?}, projection: {projection:?}");
+        /* println!("Edge: {edge_vertices:?}, point: {point:?}, projection: {projection:?}");
         println!("Full: {:?}", self.find_cells_along_edge(edge_vertices));
         println!("Partial 0: {:?}", self.find_cells_along_edge([projection, edge_vertices[0]]));
-        println!("Partial 1: {:?}", self.find_cells_along_edge([projection, edge_vertices[1]]));
+        println!("Partial 1: {:?}", self.find_cells_along_edge([projection, edge_vertices[1]])); */
 
         for cell in cells_of_splits[1].difference(&cells_of_splits[0]) {
             self.map
@@ -173,7 +173,6 @@ impl SpatialEdgeHash {
             edge_indices.map(|endpoint_index| [endpoint_index, split_point_index]);
         self.edge_indices[edge_index] = new_edges_indices[0];
         self.edge_indices.push(new_edges_indices[1]);
-        println!("Split: {:?}", self.map.keys().map(|k| (k.x, k.y, k.z)).collect::<Vec<_>>());
     }
 
     pub fn edges_in_cells_near_point(&self, point: Vector3<f32>) -> HashSet<usize> {

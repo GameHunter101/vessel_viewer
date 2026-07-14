@@ -58,16 +58,54 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         let positions: Vec<Vector3<f32>> = values
             .into_iter()
             .enumerate()
-            .map(|(i, val)| {
-                Vector3::new(
+            .flat_map(|(i, val)| {
+                let point = Vector3::new(
                     i as f32 * AREA_SIZE as f32,
                     val as f32 * (473.0 - 39.0),
                     0.0,
                 ) / self.num_probes as f32
-                    + Vector3::new(0.0, 39.0, 0.0)
+                    + Vector3::new(0.0, 39.0, 0.0);
+                if self.point_in_boundary(point, 0.01) {
+                    Some(point)
+                } else {
+                    None
+                }
             })
             .collect();
         self.probes = positions;
+    }
+
+    fn point_in_boundary(&self, point: Vector3<f32>, intersection_threshold: f32) -> bool {
+        let ray_dir = Vector3::x();
+
+        let mut ray_origin = point;
+        let mut num_intersections = 0;
+
+        while 0.0 <= ray_origin.x
+            && 0.0 <= ray_origin.y
+            && AREA_SIZE as f32 >= ray_origin.x
+            && AREA_SIZE as f32 >= ray_origin.y
+        {
+            let distance = Self::boundary_sdf(ray_origin);
+            ray_origin += ray_dir * distance;
+            if distance < intersection_threshold {
+                num_intersections += 1;
+                ray_origin += intersection_threshold * 5.0 * ray_dir;
+            }
+        }
+
+        num_intersections % 2 != 0
+    }
+
+    fn boundary_sdf(point: Vector3<f32>) -> f32 {
+        initialize_points().1
+            .iter()
+            .map(|edge| {
+                vector_project(edge[1] - edge[0], point - edge[0])
+                    .metric_distance(&(point - edge[0]))
+            })
+            .reduce(|acc, e| acc.min(e))
+            .unwrap()
     }
 
     fn update_buffers(
@@ -95,7 +133,9 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         let edges: Vec<ComputeEdge> = all_edges
             .iter()
             .map(|edge| {
-                let edge = edge.map(|point| (point / (AREA_SIZE as f32 / 2.0) - Vector3::new(1.0, 1.0, 0.0)) / 2.0);
+                let edge = edge.map(|point| {
+                    (point / (AREA_SIZE as f32 / 2.0) - Vector3::new(1.0, 1.0, 0.0)) / 2.0
+                });
                 ComputeEdge::new([edge[0].x, edge[0].y], [edge[1].x, edge[1].y])
             })
             .collect();
@@ -162,33 +202,6 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         }
 
         (distance, closest_edge, pos)
-    }
-
-    fn raycast_barrier_in_dir(
-        &self,
-        origin: Vector3<f32>,
-        dir: Vector3<f32>,
-        max_dist: f32,
-        max_iter_count: u32,
-        min_dist: f32,
-    ) -> (usize, f32) {
-        let mut pos = origin;
-        let mut distance = 0.0;
-        let mut closest_barrier = 0;
-        for _ in 0..max_iter_count {
-            if distance >= max_dist {
-                break;
-            }
-            let (next_barrier, next_distance) = self.edge_map.eval_barrier_sdf_field(pos).unwrap();
-            pos += dir * next_distance;
-            distance += next_distance;
-            closest_barrier = next_barrier;
-            if next_distance < min_dist {
-                break;
-            }
-        }
-
-        (closest_barrier, distance)
     }
 
     /// Displays a line at the cursor in the direction of the sdf field with proper magnitude
@@ -346,8 +359,8 @@ impl<T: Rng> NetworkGenerationComponent<T> {
 
         let (sdf_distance_at_edge_center, _) = self.edge_map.eval_sdf_field(edge_center).unwrap();
 
-        let sdf_distance_at_edge_center = sdf_distance_at_edge_center
-            .min(self.edge_map.eval_barrier_sdf_field(edge_center).unwrap().1);
+        let sdf_distance_at_edge_center =
+            sdf_distance_at_edge_center.min(self.edge_map.eval_sdf_field(edge_center).unwrap().0);
 
         for edge_point in edge {
             let main_dir = (edge_center - edge_point).normalize();
@@ -371,6 +384,10 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 {
     fn initialize(&mut self, _device: &Device) -> ActionQueue {
         self.distribute_probes();
+        println!(
+            "{:?}",
+            self.probes.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()
+        );
         self.set_initialized();
         vec![Box::new(RegisterUiComponentAction {
             component_id: self.id,
@@ -396,8 +413,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             return Vec::new();
         }
 
-        println!("Iter");
-
         let a = std::time::Instant::now();
         let (probe_index, target_oxygen_probe) = self
             .probes
@@ -417,42 +432,9 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             self.raycast_in_dir(target_oxygen_probe, -sdf_gradient, 1000.0, 50, 0.01);
         let raycast_edges = [first_raycast_pos, second_raycast_pos];
 
-        let [
-            (first_barrier_intersection_edge, first_barrier_distance),
-            (second_barrier_intersection_edge, second_barrier_distance),
-        ] = [1.0, -1.0].map(|c| {
-            self.raycast_barrier_in_dir(target_oxygen_probe, c * sdf_gradient, 1000.0, 50, 0.01)
-        });
-
         let first_edge = self.edge_map.edge(first_edge_index);
-        /* let first_edge = if first_ray_distance > first_barrier_distance {
-            let barrier_edge = self.edge_map.barrier_edges()[first_barrier_intersection_edge];
-            let intersection_point = target_oxygen_probe + first_barrier_distance * sdf_gradient;
-            if barrier_edge[0].metric_distance(&intersection_point)
-                < barrier_edge[1].metric_distance(&intersection_point)
-            {
-                [barrier_edge[0]; 2]
-            } else {
-                [barrier_edge[1]; 2]
-            }
-        } else {
-            self.edge_map.edge(first_edge_index)
-        }; */
 
         let second_edge = self.edge_map.edge(second_edge_index);
-        /* let second_edge = if second_ray_distance > second_barrier_distance {
-            let barrier_edge = self.edge_map.barrier_edges()[second_barrier_intersection_edge];
-            let intersection_point = target_oxygen_probe - second_barrier_distance * sdf_gradient;
-            if barrier_edge[0].metric_distance(&intersection_point)
-                < barrier_edge[1].metric_distance(&intersection_point)
-            {
-                [barrier_edge[0]; 2]
-            } else {
-                [barrier_edge[1]; 2]
-            }
-        } else {
-            self.edge_map.edge(second_edge_index)
-        }; */
 
         let min_oxygen_edge = self.find_minimum_oxygen_edge(
             10,
@@ -469,22 +451,12 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             )
         });
 
-        /* // TODO: Temporary barrier detection, replace with more elegant detection and edge redirection
-        if (new_edge_points[0].x > AREA_SIZE as f32 || new_edge_points[0].x < 0.0)
-            || (new_edge_points[1].x > AREA_SIZE as f32 || new_edge_points[1].x < 0.0)
-        {
-            self.distribute_probes();
-            return Vec::new();
-        } */
-
         if first_edge[0] != first_edge[1] {
-            // println!("Edge: {first_edge:?}, split: {:?}", new_edge_points[0]);
             self.edge_map
                 .split_edge_at_point(first_edge_index, new_edge_points[0]);
         }
 
         if second_edge[0] != second_edge[1] {
-            // println!("Edge: {second_edge:?}, split: {:?}", new_edge_points[1]);
             self.edge_map
                 .split_edge_at_point(second_edge_index, new_edge_points[1]);
         }
@@ -498,10 +470,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         if let Some(component) = other_components
             .iter_mut()
             .find(|comp| comp.id() == self.vessel_edges_component)
-            /* && let Some(compute) = computes
-                .iter_mut()
-                .find(|comp| comp.id() == self.display_vessel_edges_compute)
-            && let ShaderAttachment::Buffer(buf) = &mut compute.attachments_mut()[0] */
             && let Some(material) = materials
                 .iter_mut()
                 .find(|material| material.id() == self.vessel_sdf_material)
@@ -520,7 +488,9 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         self.current_iter += 1;
 
         self.num_probes += 1;
-        self.distribute_probes();
+        if self.current_iter % 10 == 0 {
+            self.distribute_probes();
+        }
 
         /* println!(
             "frame time: {}",
