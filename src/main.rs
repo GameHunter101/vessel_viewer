@@ -24,6 +24,7 @@ use crate::{
 
 mod network_generation_component;
 mod spatial_edge_hash;
+mod marching_cubes;
 
 #[tokio::main]
 async fn main() {

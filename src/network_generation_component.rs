@@ -18,6 +18,7 @@ use wgpu::{Device, Queue};
 
 use crate::{
     AREA_SIZE, ComputeEdge, Vertex, initialize_points,
+    marching_cubes::MarchingCubes,
     spatial_edge_hash::{Edge, SpatialEdgeHash},
 };
 
@@ -98,7 +99,8 @@ impl<T: Rng> NetworkGenerationComponent<T> {
     }
 
     fn boundary_sdf(point: Vector3<f32>) -> f32 {
-        initialize_points().1
+        initialize_points()
+            .1
             .iter()
             .map(|edge| {
                 vector_project(edge[1] - edge[0], point - edge[0])
@@ -377,6 +379,59 @@ impl<T: Rng> NetworkGenerationComponent<T> {
             self.edge_map.insert_edge([edge_point, branch_point]);
         }
     }
+
+    fn cylinder_sdf(point: Vector3<f32>, edge: Edge, thickness: f32) -> f32 {
+        let [a, b] = edge;
+        let ba = b - a;
+        let pa = point - a;
+        let baba = ba.dot(&ba);
+        let paba = pa.dot(&ba);
+        let x = (pa * baba - ba * paba).norm() - thickness * baba;
+        let y = (paba - baba * 0.5).abs() - baba * 0.5;
+        let x2 = x * x;
+        let y2 = y * y * baba;
+        let d = if x.max(y) < 0.0 {
+            -x2.min(y2)
+        } else {
+            let lhs = if x > 0.0 { x2 } else { 0.0 };
+            let rhs = if y > 0.0 { y2 } else { 0.0 };
+            lhs + rhs
+        };
+
+        d.signum() * d.abs().sqrt() / baba
+    }
+
+    fn vessel_sdf(&self, point: Vector3<f32>, thickness: f32) -> f32 {
+        let nearby_edges = self.edge_map.edges_in_cells_near_point(point);
+
+        nearby_edges
+            .into_iter()
+            .map(|edge_index| {
+                let edge = self.edge_map.edge(edge_index);
+
+                Self::cylinder_sdf(point, edge, thickness)
+            })
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(0.0)
+    }
+
+    fn generate_mesh(&self, thickness: f32) {
+        let padding = 5.0;
+        let sdf = move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
+        let marching_cubes = MarchingCubes::new(
+            [
+            Vector3::new(-padding, -padding, -padding),
+            Vector3::new(
+                AREA_SIZE as f32 + padding,
+                AREA_SIZE as f32 + padding,
+                padding,
+            ),
+            ],
+            &sdf,
+            100, 100, 20
+        );
+        marching_cubes.march_cubes(0.01);
+    }
 }
 
 impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
@@ -523,6 +578,8 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         0.0..=1.0,
                     ));
 
+                    let iter_label = ui.label(&format!("Current iter: {}", self.current_iter));
+
                     let old_val = self.max_iter_count;
                     let iter_count = ui.add(
                         egui::DragValue::new(&mut self.max_iter_count)
@@ -540,9 +597,14 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         self.edge_map = SpatialEdgeHash::new(self.edge_map.cell_size(), boundary);
                     }
 
+                    if ui.add(egui::Button::new("Generate STL")).clicked() {
+                        self.generate_mesh(0.1);
+                    }
+
                     orthogonality_factor_slider.labelled_by(orthogonality_lerp_factor_label.id);
                     branch_width_factor_slider.labelled_by(branch_width_factor_label.id);
                     branch_length_factor_slider.labelled_by(branch_length_factor_label.id);
+                    iter_count.labelled_by(iter_label.id);
                 });
             });
     }
