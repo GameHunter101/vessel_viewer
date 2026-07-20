@@ -416,19 +416,23 @@ impl<T: Rng> NetworkGenerationComponent<T> {
     }
 
     fn generate_mesh(&self, thickness: f32) {
-        let padding = 5.0;
+        let padding = 1.0;
         let sdf = move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
+        // let sdf = |point: Vector3<f32>| point.norm() - 0.3;
         let marching_cubes = MarchingCubes::new(
             [
-            Vector3::new(-padding, -padding, -padding),
+            Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
             Vector3::new(
-                AREA_SIZE as f32 + padding,
-                AREA_SIZE as f32 + padding,
-                padding,
+                AREA_SIZE as f32 + thickness + padding,
+                AREA_SIZE as f32 + thickness + padding,
+                thickness + padding,
             ),
+            // Vector3::new(-1.0, -1.0, -1.0),
+            // Vector3::new(1.0, 1.0, 1.0)
             ],
             &sdf,
-            100, 100, 20
+            220, 220, 8
+            // 50, 50, 50
         );
         marching_cubes.march_cubes(0.01);
     }
@@ -439,10 +443,10 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
 {
     fn initialize(&mut self, _device: &Device) -> ActionQueue {
         self.distribute_probes();
-        println!(
+        /* println!(
             "{:?}",
             self.probes.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()
-        );
+        ); */
         self.set_initialized();
         vec![Box::new(RegisterUiComponentAction {
             component_id: self.id,
@@ -598,7 +602,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                     }
 
                     if ui.add(egui::Button::new("Generate STL")).clicked() {
-                        self.generate_mesh(0.1);
+                        self.generate_mesh(2.0);
                     }
 
                     orthogonality_factor_slider.labelled_by(orthogonality_lerp_factor_label.id);
