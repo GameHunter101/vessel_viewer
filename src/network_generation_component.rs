@@ -50,7 +50,7 @@ pub struct NetworkGenerationComponent<T> {
     probes: Vec<Vector3<f32>>,
 }
 
-impl<T: Rng> NetworkGenerationComponent<T> {
+impl<T: Rng + Sync> NetworkGenerationComponent<T> {
     /// Creates a low-discrepancy sequence using the N-rooks algorithm.
     /// https://blog.demofox.org/2017/05/29/when-random-numbers-are-too-random-low-discrepancy-sequences/
     fn distribute_probes(&mut self) {
@@ -380,45 +380,29 @@ impl<T: Rng> NetworkGenerationComponent<T> {
         }
     }
 
-    fn cylinder_sdf(point: Vector3<f32>, edge: Edge, thickness: f32) -> f32 {
-        let [a, b] = edge;
-        let ba = b - a;
-        let pa = point - a;
-        let baba = ba.dot(&ba);
-        let paba = pa.dot(&ba);
-        let x = (pa * baba - ba * paba).norm() - thickness * baba;
-        let y = (paba - baba * 0.5).abs() - baba * 0.5;
-        let x2 = x * x;
-        let y2 = y * y * baba;
-        let d = if x.max(y) < 0.0 {
-            -x2.min(y2)
-        } else {
-            let lhs = if x > 0.0 { x2 } else { 0.0 };
-            let rhs = if y > 0.0 { y2 } else { 0.0 };
-            lhs + rhs
-        };
-
-        d.signum() * d.abs().sqrt() / baba
-    }
-
     fn vessel_sdf(&self, point: Vector3<f32>, thickness: f32) -> f32 {
         let nearby_edges = self.edge_map.edges_in_cells_near_point(point);
+
+        let vector_min = |a: Vector3<f32>, b: Vector3<f32>| Vector3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
+        let vector_max = |a: Vector3<f32>, b: Vector3<f32>| Vector3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z));
 
         nearby_edges
             .into_iter()
             .map(|edge_index| {
-                let edge = self.edge_map.edge(edge_index);
+                let [a, b]= self.edge_map.edge(edge_index);
+                let projection = vector_project(b - a, point - a) + a;
 
-                Self::cylinder_sdf(point, edge, thickness)
-            })
-            .min_by(|a, b| a.total_cmp(b))
-            .unwrap_or(0.0)
+                let min_point = vector_min(a, b);
+                let max_point = vector_max(a, b);
+                let clamped_projection = vector_max(vector_min(projection, max_point), min_point);
+
+                clamped_projection.metric_distance(&point) - thickness
+            }).min_by(|a, b| a.total_cmp(b)).unwrap()
     }
 
     fn generate_mesh(&self, thickness: f32) {
         let padding = 1.0;
-        let sdf = move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
-        // let sdf = |point: Vector3<f32>| point.norm() - 0.3;
+        let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) = &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
         let marching_cubes = MarchingCubes::new(
             [
             Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
@@ -427,14 +411,11 @@ impl<T: Rng> NetworkGenerationComponent<T> {
                 AREA_SIZE as f32 + thickness + padding,
                 thickness + padding,
             ),
-            // Vector3::new(-1.0, -1.0, -1.0),
-            // Vector3::new(1.0, 1.0, 1.0)
             ],
             &sdf,
-            220, 220, 8
-            // 50, 50, 50
+            200, 200, 8
         );
-        marching_cubes.march_cubes(0.01);
+        marching_cubes.march_cubes(0.00001);
     }
 }
 
@@ -629,7 +610,7 @@ pub fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
 #[cfg(test)]
 mod test {
     use nalgebra::Vector3;
-    use rand::rng;
+    use rand::{SeedableRng, rng};
 
     use crate::{
         AREA_SIZE,
@@ -640,7 +621,7 @@ mod test {
     #[test]
     fn sdf_test_single_edge() {
         let network = NetworkGenerationComponent::builder()
-            .rng(rng())
+            .rng(rand::rngs::StdRng::seed_from_u64(0))
             .edge_map(SpatialEdgeHash::new(
                 40.0,
                 vec![[[-1.0, -0.85], [1.0, -0.85]].map(|p| {
@@ -675,7 +656,7 @@ mod test {
     #[test]
     fn sdf_test_two_edges() {
         let network = NetworkGenerationComponent::builder()
-            .rng(rng())
+            .rng(rand::rngs::StdRng::seed_from_u64(0))
             .edge_map(SpatialEdgeHash::new(
                 40.0,
                 [[[-1.0, -0.85], [1.0, -0.85]], [[1.0, 0.85], [-1.0, 0.85]]]

@@ -29,6 +29,13 @@ fn sd_capped_cylinder(p: vec3f, a: vec3f, b: vec3f, r: f32) -> f32 {
   return sign(d)*sqrt(abs(d))/baba;
 }
 
+fn distance_to_edge(p: vec3f, a: vec3f, b: vec3f) -> f32 {
+    let line = b - a;
+    let proj = clamp(dot(line, (p - a)) / dot(line, line) * line + a, min(a, b), max(a,b));
+
+    return distance(p, proj);
+}
+
 fn smooth_union(a: f32, b: f32, smoothing: f32) -> f32 {
     let k = smoothing * 4.0;
     let h = max(k - abs(a - b), 0.0);
@@ -37,13 +44,17 @@ fn smooth_union(a: f32, b: f32, smoothing: f32) -> f32 {
 
 fn map(p: vec3f, vessel_thickness: f32, smooth_factor: f32) -> f32 {
     var val = 0x1.fffffep+127;
+    var numerator = 0.0;
+    var denominator = 0.0;
     for (var i = 0; i < SIZE; i++) {
         let edge = vessel_edges[i];
-        let cylinder = sd_capped_cylinder(p, vec3f(edge.p1, 0.0), vec3f(edge.p2, 0.0), vessel_thickness) - vessel_thickness * smooth_factor;
-        val = smooth_union(val, cylinder, vessel_thickness * smooth_factor);
         if all(edge.p1 == edge.p2) {
             break;
         }
+        // let cylinder = sd_capped_cylinder(p, vec3f(edge.p1, 0.0), vec3f(edge.p2, 0.0), vessel_thickness) - vessel_thickness * smooth_factor;
+        let cylinder = distance_to_edge(p, vec3f(edge.p1, 0.0), vec3f(edge.p2, 0.0)) - vessel_thickness;
+        val = min(val, cylinder);
+        // val = smooth_union(val, cylinder, vessel_thickness * smooth_factor);
     }
 
     return val;
@@ -72,7 +83,7 @@ fn main(in: VertexOutput) -> @location(0) vec4<f32> {
     var t = 0.0;
 
     let vessel_thickness = 0.01;
-    let smooth_factor = 0.1;
+    let smooth_factor = vessel_thickness / 5.0;
 
     for (var i = 0; i < 100; i++) {
         if t > 100.0 {
@@ -88,12 +99,4 @@ fn main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return vec4f(0.0);
-
-    /* let val = textureSample(oxygen_tex, oxygen_sampler, in.tex_coords).xyz;
-    let pos = max(val, vec3f(0.0));
-    let neg = cross(-min(val.xyz, vec3f(0.0)), vec3f(1.0));
-    let brightness = luminance(abs(textureSample(oxygen_tex, oxygen_sampler, in.tex_coords).xyz));
-    let oxygen_dir = lic(vec2u(in.tex_coords * 512.0), 5, oxygen_tex) * brightness;
-    // return vec4f((pos + neg), 1.0);
-    return vec4f(vec3f(oxygen_dir), 1.0); */
 }
