@@ -396,13 +396,16 @@ impl<T: Rng + Sync> NetworkGenerationComponent<T> {
                 let max_point = vector_max(a, b);
                 let clamped_projection = vector_max(vector_min(projection, max_point), min_point);
 
-                clamped_projection.metric_distance(&point) - thickness
+                let dist = clamped_projection - point;
+
+                dist.dot(&dist) - thickness * thickness
             }).min_by(|a, b| a.total_cmp(b)).unwrap()
     }
 
     fn generate_mesh(&self, thickness: f32) {
         let padding = 1.0;
         let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) = &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
+        let tik = std::time::Instant::now();
         let marching_cubes = MarchingCubes::new(
             [
             Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
@@ -413,9 +416,11 @@ impl<T: Rng + Sync> NetworkGenerationComponent<T> {
             ),
             ],
             &sdf,
-            200, 200, 8
+            300, 300, 12
         );
+        let tok = std::time::Instant::now();
         marching_cubes.march_cubes(0.00001);
+        println!("Total: {}, grid gen: {}, polygonization: {}", tik.elapsed().as_secs(), (tok - tik).as_secs(), tok.elapsed().as_secs());
     }
 }
 

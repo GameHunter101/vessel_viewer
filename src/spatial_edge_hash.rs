@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
+};
 
 use egui::emath::OrderedFloat;
 use nalgebra::{Vector2, Vector3};
@@ -7,6 +10,9 @@ use crate::network_generation_component::{points_are_close, vector_project};
 
 pub type Edge = [Vector3<f32>; 2];
 
+const CACHE_SIZE: usize = 10;
+type CellCache = Arc<RwLock<Vec<Option<(Vector3<u32>, HashSet<usize>)>>>>;
+
 #[derive(Debug, Clone)]
 pub struct SpatialEdgeHash {
     map: HashMap<Vector3<u32>, HashSet<usize>>,
@@ -14,6 +20,7 @@ pub struct SpatialEdgeHash {
     edge_indices: Vec<[usize; 2]>,
     barrier_edges: Vec<Edge>,
     cell_size: f32,
+    last_cells_memoization: CellCache,
 }
 
 #[allow(unused)]
@@ -31,6 +38,7 @@ impl SpatialEdgeHash {
                 ],
             ],
             cell_size: spatial_subdivision,
+            last_cells_memoization: Arc::new(RwLock::new(vec![None; CACHE_SIZE])),
         };
         for edge in edges {
             edge_hash.insert_edge(edge);
@@ -122,6 +130,9 @@ impl SpatialEdgeHash {
                 self.map.insert(cell, HashSet::from_iter([edge_index]));
             }
         }
+
+        let mut memo = self.last_cells_memoization.write().unwrap();
+        *memo = vec![None; CACHE_SIZE];
     }
 
     /// Takes an edge `edge_index` and splits it up into two new edges at `point`. Does nothing if
@@ -138,7 +149,10 @@ impl SpatialEdgeHash {
 
         let edge_vertices = edge_indices.map(|vert_index| self.verts[vert_index]);
 
-        let projection = vector_project(edge_vertices[1] - edge_vertices[0], point - edge_vertices[0]) + edge_vertices[0];
+        let projection = vector_project(
+            edge_vertices[1] - edge_vertices[0],
+            point - edge_vertices[0],
+        ) + edge_vertices[0];
 
         // First index will correspond to the "old" edge, second index corresponds to the "new" edge from the split
         let cells_of_splits = edge_indices.map(|endpoint_index| {
@@ -173,26 +187,72 @@ impl SpatialEdgeHash {
             edge_indices.map(|endpoint_index| [endpoint_index, split_point_index]);
         self.edge_indices[edge_index] = new_edges_indices[0];
         self.edge_indices.push(new_edges_indices[1]);
+
+        let mut memo = self.last_cells_memoization.write().unwrap();
+        *memo = vec![None; CACHE_SIZE];
     }
 
     pub fn edges_in_cells_near_point(&self, point: Vector3<f32>) -> HashSet<usize> {
         let point_cell = self.floor_point_to_grid(point);
-        (-1..=1)
-            .flat_map(|x| {
-                (-1..=1).flat_map(move |y| {
-                    (-1..=1).flat_map(move |z| {
-                        let current_cell = Vector3::new(
-                            point_cell.x.saturating_add_signed(x),
-                            point_cell.y.saturating_add_signed(y),
-                            point_cell.z.saturating_add_signed(z),
-                        );
-                        self.map.get(&current_cell)
-                    })
-                })
+        if let Ok(cache) = self.last_cells_memoization.write().as_deref_mut()
+            && let Some(cache_index) = cache.iter().position(|cell_res| {
+                if let Some((cell, _)) = cell_res {
+                    *cell == point_cell
+                } else {
+                    false
+                }
             })
-            .flatten()
-            .copied()
-            .collect()
+        {
+            // println!("Memo hit");
+            cache.swap(0, cache_index);
+            return cache[0].clone().unwrap().1;
+        }
+
+        let nearby_edges: HashSet<usize> = [
+            (-1, -1, -1),
+            (-1, -1, 0),
+            (-1, -1, 1),
+            (-1, 0, -1),
+            (-1, 0, 0),
+            (-1, 0, 1),
+            (-1, 1, -1),
+            (-1, 1, 0),
+            (-1, 1, 1),
+            (0, -1, -1),
+            (0, -1, 0),
+            (0, -1, 1),
+            (0, 0, -1),
+            (0, 0, 0),
+            (0, 0, 1),
+            (0, 1, -1),
+            (0, 1, 0),
+            (0, 1, 1),
+            (1, -1, -1),
+            (1, -1, 0),
+            (1, -1, 1),
+            (1, 0, -1),
+            (1, 0, 0),
+            (1, 0, 1),
+            (1, 1, -1),
+            (1, 1, 0),
+            (1, 1, 1),
+        ]
+        .into_iter()
+        .flat_map(|(x, y, z)| {
+            let current_cell = Vector3::new(
+                point_cell.x.saturating_add_signed(x),
+                point_cell.y.saturating_add_signed(y),
+                point_cell.z.saturating_add_signed(z),
+            );
+            self.map.get(&current_cell).cloned().unwrap_or_default()
+        })
+        .collect();
+
+        let mut memo = self.last_cells_memoization.write().unwrap();
+        memo.rotate_right(1);
+        memo[0] = Some((point_cell, nearby_edges.clone()));
+
+        nearby_edges
     }
 
     /// The SDF function for an edge defined by two points.
@@ -325,6 +385,8 @@ impl SpatialEdgeHash {
     }
 
     pub fn verts_mut(&mut self) -> &mut Vec<Vector3<f32>> {
+        let mut memo = self.last_cells_memoization.write().unwrap();
+        *memo = vec![None; CACHE_SIZE];
         &mut self.verts
     }
 
@@ -609,11 +671,13 @@ mod test {
         }
     }
 
-
     #[test]
     fn sensitivity_check() {
-        let edge = [Vector3::new(395.63635, 408.31998, 0.0), Vector3::new(188.14307, 303.6836, 0.0)];
-        let mut cube = SpatialEdgeHash::new(60.0, Vec::new());
+        let edge = [
+            Vector3::new(395.63635, 408.31998, 0.0),
+            Vector3::new(188.14307, 303.6836, 0.0),
+        ];
+        let cube = SpatialEdgeHash::new(60.0, Vec::new());
 
         let cells = cube.find_cells_along_edge(edge);
 
