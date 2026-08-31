@@ -383,13 +383,17 @@ impl<T: Rng + Sync> NetworkGenerationComponent<T> {
     fn vessel_sdf(&self, point: Vector3<f32>, thickness: f32) -> f32 {
         let nearby_edges = self.edge_map.edges_in_cells_near_point(point);
 
-        let vector_min = |a: Vector3<f32>, b: Vector3<f32>| Vector3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
-        let vector_max = |a: Vector3<f32>, b: Vector3<f32>| Vector3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z));
+        let vector_min = |a: Vector3<f32>, b: Vector3<f32>| {
+            Vector3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
+        };
+        let vector_max = |a: Vector3<f32>, b: Vector3<f32>| {
+            Vector3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
+        };
 
         nearby_edges
             .into_iter()
             .map(|edge_index| {
-                let [a, b]= self.edge_map.edge(edge_index);
+                let [a, b] = self.edge_map.edge(edge_index);
                 let projection = vector_project(b - a, point - a) + a;
 
                 let min_point = vector_min(a, b);
@@ -399,28 +403,38 @@ impl<T: Rng + Sync> NetworkGenerationComponent<T> {
                 let dist = clamped_projection - point;
 
                 dist.dot(&dist) - thickness * thickness
-            }).min_by(|a, b| a.total_cmp(b)).unwrap()
+            })
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap()
     }
 
     fn generate_mesh(&self, thickness: f32) {
         let padding = 1.0;
-        let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) = &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
+        let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) =
+            &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
         let tik = std::time::Instant::now();
         let marching_cubes = MarchingCubes::new(
             [
-            Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
-            Vector3::new(
-                AREA_SIZE as f32 + thickness + padding,
-                AREA_SIZE as f32 + thickness + padding,
-                thickness + padding,
-            ),
+                Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
+                Vector3::new(
+                    AREA_SIZE as f32 + thickness + padding,
+                    AREA_SIZE as f32 + thickness + padding,
+                    thickness + padding,
+                ),
             ],
             &sdf,
-            300, 300, 12
+            300,
+            300,
+            12,
         );
         let tok = std::time::Instant::now();
         marching_cubes.march_cubes(0.00001);
-        println!("Total: {}, grid gen: {}, polygonization: {}", tik.elapsed().as_secs(), (tok - tik).as_secs(), tok.elapsed().as_secs());
+        println!(
+            "Total: {}, grid gen: {}, polygonization: {}",
+            tik.elapsed().as_secs(),
+            (tok - tik).as_secs(),
+            tok.elapsed().as_secs()
+        );
     }
 }
 
@@ -533,7 +547,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         self.current_iter += 1;
 
         self.num_probes += 1;
-        if self.current_iter % 10 == 0 {
+        if self.current_iter.is_multiple_of(10) {
             self.distribute_probes();
         }
 
@@ -568,7 +582,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         0.0..=1.0,
                     ));
 
-                    let iter_label = ui.label(&format!("Current iter: {}", self.current_iter));
+                    let iter_label = ui.label(format!("Current iter: {}", self.current_iter));
 
                     let old_val = self.max_iter_count;
                     let iter_count = ui.add(
@@ -584,7 +598,15 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                     {
                         self.current_iter = 0;
                         let (_, boundary) = initialize_points();
-                        self.edge_map = SpatialEdgeHash::new(self.edge_map.cell_size(), boundary);
+                        self.edge_map = SpatialEdgeHash::new(
+                            self.edge_map.cell_size(),
+                            boundary,
+                            [
+                                AREA_SIZE as f32,
+                                AREA_SIZE as f32,
+                                self.edge_map.cell_size(),
+                            ],
+                        );
                     }
 
                     if ui.add(egui::Button::new("Generate STL")).clicked() {
@@ -633,6 +655,7 @@ mod test {
                     (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0)) * AREA_SIZE as f32
                         / 2.0
                 })],
+                [AREA_SIZE as f32, AREA_SIZE as f32, 40.0]
             ))
             .network_parameters(crate::network_generation_component::NetworkDetails {
                 edge_orthogonality_lerp_factor: 0.0,
@@ -673,6 +696,7 @@ mod test {
                         })
                     })
                     .to_vec(),
+                [AREA_SIZE as f32, AREA_SIZE as f32, 40.0],
             ))
             .network_parameters(crate::network_generation_component::NetworkDetails {
                 edge_orthogonality_lerp_factor: 0.0,
@@ -711,6 +735,7 @@ mod test {
                         })
                     })
                     .to_vec(),
+                [AREA_SIZE as f32, AREA_SIZE as f32, 50.0],
             ))
             .network_parameters(crate::network_generation_component::NetworkDetails {
                 edge_orthogonality_lerp_factor: 0.0,

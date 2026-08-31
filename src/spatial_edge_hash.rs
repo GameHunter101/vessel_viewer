@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, RwLock},
 };
 
@@ -15,19 +15,25 @@ type CellCache = Arc<RwLock<Vec<Option<(Vector3<u32>, HashSet<usize>)>>>>;
 
 #[derive(Debug, Clone)]
 pub struct SpatialEdgeHash {
-    map: HashMap<Vector3<u32>, HashSet<usize>>,
+    map: Vec<HashSet<usize>>,
     verts: Vec<Vector3<f32>>,
     edge_indices: Vec<[usize; 2]>,
     barrier_edges: Vec<Edge>,
     cell_size: f32,
     last_cells_memoization: CellCache,
+    occupied_cells: usize,
+    cell_counts: [usize; 3],
 }
 
 #[allow(unused)]
 impl SpatialEdgeHash {
-    pub fn new(spatial_subdivision: f32, edges: Vec<Edge>) -> Self {
+    pub fn new(spatial_subdivision: f32, edges: Vec<Edge>, domain_size: [f32; 3]) -> Self {
+        let x_cells = (domain_size[0] / spatial_subdivision).ceil() as usize;
+        let y_cells = (domain_size[1] / spatial_subdivision).ceil() as usize;
+        let z_cells = (domain_size[2] / spatial_subdivision).ceil() as usize;
+
         let mut edge_hash = Self {
-            map: HashMap::new(),
+            map: vec![HashSet::new(); x_cells * y_cells * z_cells],
             verts: Vec::new(),
             edge_indices: Vec::new(),
             barrier_edges: vec![
@@ -39,12 +45,18 @@ impl SpatialEdgeHash {
             ],
             cell_size: spatial_subdivision,
             last_cells_memoization: Arc::new(RwLock::new(vec![None; CACHE_SIZE])),
+            occupied_cells: 0,
+            cell_counts: [x_cells, y_cells, z_cells],
         };
         for edge in edges {
             edge_hash.insert_edge(edge);
         }
 
         edge_hash
+    }
+
+    fn cell_to_index(&self, cell: Vector3<u32>) -> usize {
+        self.cell_counts[0] * self.cell_counts[1] * cell.z as usize + self.cell_counts[0] * cell.y as usize + cell.x as usize
     }
 
     fn floor_point_to_grid(&self, point: Vector3<f32>) -> Vector3<u32> {
@@ -124,11 +136,11 @@ impl SpatialEdgeHash {
         self.edge_indices.push(edge_indices);
         let cells_to_modify = self.find_cells_along_edge(edge);
         for cell in cells_to_modify {
-            if let Some(edges_in_cell) = self.map.get_mut(&cell) {
-                edges_in_cell.insert(edge_index);
-            } else {
-                self.map.insert(cell, HashSet::from_iter([edge_index]));
+            let index = self.cell_to_index(cell);
+            if self.map[index].is_empty() {
+                self.occupied_cells += 1;
             }
+            self.map[index].insert(edge_index);
         }
 
         let mut memo = self.last_cells_memoization.write().unwrap();
@@ -160,23 +172,14 @@ impl SpatialEdgeHash {
             self.find_cells_along_edge(split_edge)
         });
 
-        /* println!("Edge: {edge_vertices:?}, point: {point:?}, projection: {projection:?}");
-        println!("Full: {:?}", self.find_cells_along_edge(edge_vertices));
-        println!("Partial 0: {:?}", self.find_cells_along_edge([projection, edge_vertices[0]]));
-        println!("Partial 1: {:?}", self.find_cells_along_edge([projection, edge_vertices[1]])); */
-
         for cell in cells_of_splits[1].difference(&cells_of_splits[0]) {
-            self.map
-                .get_mut(cell)
-                .unwrap_or_else(|| panic!("Trying to access cell {cell}"))
-                .remove(&edge_index);
+            let index = self.cell_to_index(*cell);
+            self.map[index].remove(&edge_index);
         }
 
         for cell in &cells_of_splits[1] {
-            self.map
-                .get_mut(cell)
-                .unwrap()
-                .insert(self.edge_indices.len());
+            let index = self.cell_to_index(*cell);
+            self.map[index].insert(self.edge_indices.len());
         }
 
         // Assume that there does not need to be any merging when subdividing an edge
@@ -203,7 +206,6 @@ impl SpatialEdgeHash {
                 }
             })
         {
-            // println!("Memo hit");
             cache.swap(0, cache_index);
             return cache[0].clone().unwrap().1;
         }
@@ -244,7 +246,12 @@ impl SpatialEdgeHash {
                 point_cell.y.saturating_add_signed(y),
                 point_cell.z.saturating_add_signed(z),
             );
-            self.map.get(&current_cell).cloned().unwrap_or_default()
+            let index = self.cell_to_index(current_cell);
+            if index < self.map.len() {
+                self.map[index].clone()
+            } else {
+                HashSet::new()
+            }
         })
         .collect();
 
@@ -274,23 +281,32 @@ impl SpatialEdgeHash {
         point: Vector3<f32>,
         checked_edges: &mut HashSet<usize>,
     ) -> Option<(f32, usize)> {
-        self.map.get(&cell).and_then(|cell_edges| {
-            cell_edges
-                .iter()
-                .flat_map(|&edge_index| {
-                    if checked_edges.contains(&edge_index) {
-                        None
-                    } else {
-                        checked_edges.insert(edge_index);
-                        Some((Self::edge_sdf(self.edge(edge_index), point), edge_index))
-                    }
-                })
-                .min_by(|&(a, _), &(b, _)| a.total_cmp(&b))
-        })
+        let cell_edges = &self.map[self.cell_to_index(cell)];
+        cell_edges
+            .iter()
+            .flat_map(|&edge_index| {
+                if checked_edges.contains(&edge_index) {
+                    None
+                } else {
+                    checked_edges.insert(edge_index);
+                    Some((Self::edge_sdf(self.edge(edge_index), point), edge_index))
+                }
+            })
+            .min_by(|&(a, _), &(b, _)| a.total_cmp(&b))
     }
 
     pub fn eval_sdf_field(&self, point: Vector3<f32>) -> Option<(f32, usize)> {
-        let mut remaining_cells: HashSet<Vector3<u32>> = self.map.keys().copied().collect();
+        let xy = self.cell_counts[0] * self.cell_counts[1];
+
+        let mut remaining_cells: HashSet<Vector3<u32>> = (0..self.map.len())
+            .map(|i| {
+                Vector3::new(
+                    ((i % xy) % self.cell_counts[0]) as u32,
+                    ((i % xy) / self.cell_counts[0]) as u32,
+                    (i / xy) as u32,
+                )
+            })
+            .collect();
 
         let mut ring_distance = 0;
         let mut checked_edges = HashSet::new();
@@ -395,7 +411,7 @@ impl SpatialEdgeHash {
     }
 
     pub fn occupied_cells(&self) -> usize {
-        self.map.len()
+        self.occupied_cells
     }
 
     pub fn barrier_edges(&self) -> &[Edge] {
@@ -420,16 +436,22 @@ fn nan_to_inf(val: f32) -> f32 {
 
 #[cfg(test)]
 mod test {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     use nalgebra::Vector3;
 
     use crate::spatial_edge_hash::{Edge, SpatialEdgeHash};
 
-    macro_rules! set {
-        ($($x:expr),+ $(,)?) => (
-            HashSet::from_iter([$($x),+])
-        );
+    fn assert_map_cells_are_populated(
+        edge_hash: &SpatialEdgeHash,
+        cells: Vec<(Vector3<u32>, impl std::iter::IntoIterator<Item = usize>)>,
+    ) {
+        for (cell_pos, edges) in cells {
+            assert_eq!(
+                edge_hash.map[edge_hash.cell_to_index(cell_pos)],
+                HashSet::from_iter(edges)
+            );
+        }
     }
 
     #[test]
@@ -437,35 +459,37 @@ mod test {
         let edge_hash = SpatialEdgeHash::new(
             0.5,
             vec![[Vector3::new(0.1, 0.1, 0.0), Vector3::new(0.6, 0.1, 0.0)]],
+            [1.0; 3],
         );
 
         assert_eq!(edge_hash.occupied_cells(), 2);
-        assert_eq!(
-            edge_hash.map,
-            HashMap::from_iter([
-                (Vector3::new(0_u32, 0, 0), set![0]),
-                (Vector3::new(1, 0, 0), set![0])
-            ])
+        assert_map_cells_are_populated(
+            &edge_hash,
+            vec![
+                (Vector3::new(0_u32, 0, 0), [0]),
+                (Vector3::new(1, 0, 0), [0]),
+            ],
         );
     }
 
     #[test]
     fn complex_edge_insertion() {
-        let edge_hash =
-            SpatialEdgeHash::new(1.0, vec![[Vector3::zeros(), Vector3::new(2.9, 2.4, 0.0)]]);
-
-        let index_set = set![0];
+        let edge_hash = SpatialEdgeHash::new(
+            1.0,
+            vec![[Vector3::zeros(), Vector3::new(2.9, 2.4, 0.0)]],
+            [5.0, 5.0, 1.0],
+        );
 
         assert_eq!(edge_hash.occupied_cells(), 5);
-        assert_eq!(
-            edge_hash.map,
-            HashMap::from_iter([
-                (Vector3::new(0, 0, 0), index_set.clone()),
-                (Vector3::new(1, 0, 0), index_set.clone()),
-                (Vector3::new(1, 1, 0), index_set.clone()),
-                (Vector3::new(2, 1, 0), index_set.clone()),
-                (Vector3::new(2, 2, 0), index_set),
-            ])
+        assert_map_cells_are_populated(
+            &edge_hash,
+            vec![
+                (Vector3::new(0, 0, 0), [0]),
+                (Vector3::new(1, 0, 0), [0]),
+                (Vector3::new(1, 1, 0), [0]),
+                (Vector3::new(2, 1, 0), [0]),
+                (Vector3::new(2, 2, 0), [0]),
+            ],
         );
     }
 
@@ -474,13 +498,11 @@ mod test {
         let edge_hash = SpatialEdgeHash::new(
             0.5,
             vec![[Vector3::new(0.5, 0.5, 0.5), Vector3::new(0.9, 0.8, 0.7)]],
+            [1.5; 3]
         );
 
         assert_eq!(edge_hash.occupied_cells(), 1);
-        assert_eq!(
-            edge_hash.map,
-            HashMap::from_iter([(Vector3::new(1, 1, 1), set![0])])
-        )
+        assert_map_cells_are_populated(&edge_hash, vec![(Vector3::new(1, 1, 1), [0])])
     }
 
     #[test]
@@ -488,17 +510,18 @@ mod test {
         let mut edge_hash = SpatialEdgeHash::new(
             0.5,
             vec![[Vector3::new(0.1, 0.1, 0.0), Vector3::new(0.6, 0.1, 0.0)]],
+            [1.5; 3]
         );
 
         edge_hash.split_edge_at_point(0, Vector3::new(0.3, 0.1, 0.0));
 
         assert_eq!(edge_hash.occupied_cells(), 2);
-        assert_eq!(
-            edge_hash.map,
-            HashMap::from_iter([
-                (Vector3::new(0, 0, 0), set![0, 1]),
-                (Vector3::new(1, 0, 0), set![1]),
-            ])
+        assert_map_cells_are_populated(
+            &edge_hash,
+            vec![
+                (Vector3::new(0, 0, 0), vec![0, 1]),
+                (Vector3::new(1, 0, 0), vec![1]),
+            ],
         );
         assert_eq!(edge_hash.verts.len(), 3);
     }
@@ -506,20 +529,20 @@ mod test {
     #[test]
     fn complex_edge_split() {
         let mut edge_hash =
-            SpatialEdgeHash::new(1.0, vec![[Vector3::zeros(), Vector3::new(2.9, 2.4, 0.0)]]);
+            SpatialEdgeHash::new(1.0, vec![[Vector3::zeros(), Vector3::new(2.9, 2.4, 0.0)]], [4.0; 3]);
 
         edge_hash.split_edge_at_point(0, Vector3::new(1.85, 1.53, 0.0));
 
         assert_eq!(edge_hash.occupied_cells(), 5);
-        assert_eq!(
-            edge_hash.map,
-            HashMap::from_iter([
-                (Vector3::new(0, 0, 0), set![0]),
-                (Vector3::new(1, 0, 0), set![0]),
-                (Vector3::new(1, 1, 0), set![0, 1]),
-                (Vector3::new(2, 1, 0), set![1]),
-                (Vector3::new(2, 2, 0), set![1]),
-            ])
+        assert_map_cells_are_populated(
+            &edge_hash,
+            vec![
+                (Vector3::new(0, 0, 0), vec![0]),
+                (Vector3::new(1, 0, 0), vec![0]),
+                (Vector3::new(1, 1, 0), vec![0, 1]),
+                (Vector3::new(2, 1, 0), vec![1]),
+                (Vector3::new(2, 2, 0), vec![1]),
+            ],
         );
     }
 
@@ -548,7 +571,7 @@ mod test {
     #[test]
     fn axis_aligned_positive_x() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [4.0, 4.0, 1.0]);
 
         let ray = make_edge([0.5, 0.5, 0.5], [2.0, 0.5, 0.5]);
         let hit = cube.cube_ray_intersection(ray);
@@ -559,7 +582,7 @@ mod test {
     #[test]
     fn axis_aligned_negative_x() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [2.0; 3]);
 
         let ray = make_edge([0.5, 0.5, 0.5], [-1.0, 0.5, 0.5]);
         let hit = cube.cube_ray_intersection(ray);
@@ -570,7 +593,7 @@ mod test {
     #[test]
     fn axis_aligned_positive_y() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [2.0, 2.0, 1.0]);
 
         let ray = make_edge([0.2, 0.3, 0.4], [0.2, 2.0, 0.4]);
         let hit = cube.cube_ray_intersection(ray);
@@ -581,7 +604,7 @@ mod test {
     #[test]
     fn axis_aligned_positive_z() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [1.0; 3]);
 
         let ray = make_edge([0.2, 0.3, 0.4], [0.2, 0.3, 2.0]);
         let hit = cube.cube_ray_intersection(ray);
@@ -592,7 +615,7 @@ mod test {
     #[test]
     fn diagonal_hits_corner() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [4.0; 3]);
 
         let ray = make_edge([0.5, 0.5, 0.5], [2.0, 2.0, 2.0]);
         let hit = cube.cube_ray_intersection(ray);
@@ -603,7 +626,7 @@ mod test {
     #[test]
     fn diagonal_hits_edge() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [3.0, 3.0, 1.0]);
 
         let ray = make_edge([0.5, 0.5, 0.5], [2.0, 2.0, 0.5]);
         let hit = cube.cube_ray_intersection(ray);
@@ -614,7 +637,7 @@ mod test {
     #[test]
     fn arbitrary_direction() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [2.0, 2.0, 1.0]);
 
         let ray = make_edge([0.3, 0.4, 0.5], [1.5, 0.6, 0.7]);
         let hit = cube.cube_ray_intersection(ray);
@@ -625,7 +648,7 @@ mod test {
     #[test]
     fn very_close_to_face() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [3.0; 3]);
 
         let ray = make_edge([0.9999, 0.5, 0.5], [2.0, 0.5, 0.5]);
         let hit = cube.cube_ray_intersection(ray);
@@ -636,7 +659,7 @@ mod test {
     #[test]
     fn starting_near_corner() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [2.0; 3]);
 
         let ray = make_edge([0.001, 0.001, 0.001], [-1.0, -1.0, -1.0]);
         let hit = cube.cube_ray_intersection(ray);
@@ -647,7 +670,7 @@ mod test {
     #[test]
     fn random_directions_stay_on_surface() {
         let cell = 1.0;
-        let cube = SpatialEdgeHash::new(cell, Vec::new());
+        let cube = SpatialEdgeHash::new(cell, Vec::new(), [2.0; 3]);
 
         let origins = [[0.5, 0.5, 0.5], [0.2, 0.7, 0.3], [0.8, 0.1, 0.9]];
 
@@ -677,7 +700,7 @@ mod test {
             Vector3::new(395.63635, 408.31998, 0.0),
             Vector3::new(188.14307, 303.6836, 0.0),
         ];
-        let cube = SpatialEdgeHash::new(60.0, Vec::new());
+        let cube = SpatialEdgeHash::new(60.0, Vec::new(), [500.0, 500.0, 60.0]);
 
         let cells = cube.find_cells_along_edge(edge);
 
@@ -699,7 +722,7 @@ mod test {
     }
 
     fn build_field(edges: Vec<Edge>) -> SpatialEdgeHash {
-        SpatialEdgeHash::new(60.0, edges)
+        SpatialEdgeHash::new(60.0, edges, [500.0, 500.0, 60.0])
     }
 
     #[test]

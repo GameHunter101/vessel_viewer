@@ -37,7 +37,7 @@ async fn main() {
             winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(800, 800)),
         ))
         .build()
-        .await;
+        .await.unwrap();
 
     let rendering_manager = engine.rendering_manager();
     let device = rendering_manager.device();
@@ -78,7 +78,7 @@ async fn main() {
                 extra_usages: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
                 ..Default::default()
             },
-        );
+        ).unwrap();
 
     let oxygen_concentration_display_texture_bundle = TextureBundle::new(
         oxygen_concentration_texture.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -141,7 +141,7 @@ async fn main() {
                 ),
                 NetworkGenerationComponent(
                     rng: StdRng::seed_from_u64(0),
-                    edge_map: SpatialEdgeHash::new(60.0, boundary),
+                    edge_map: SpatialEdgeHash::new(60.0, boundary, [AREA_SIZE as f32, AREA_SIZE as f32, 60.0]),
                     vessel_oxygen_transport_distance: 40.0,
                     max_iter_count: 1,
                     network_parameters: NetworkDetails {
