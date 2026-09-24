@@ -1,6 +1,254 @@
 use std::io::Write;
 
 use nalgebra::Vector3;
+use rand::rngs::StdRng;
+use v4::{
+    builtin_actions::RegisterUiComponentAction,
+    component,
+    ecs::{
+        actions::ActionQueue,
+        component::{ComponentDetails, ComponentSystem, UpdateParams},
+        compute::Compute,
+        scene::Id,
+    },
+};
+use wgpu::{Device, Queue};
+
+use crate::{
+    AREA_SIZE, MAX_EDGES_IN_CELL, network_generation_component::NetworkGenerationComponent,
+};
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MarchingCubesData {
+    domain_padding: f32,
+    vessel_thickness: f32,
+    area_size: f32,
+    domain_bottom_left: [f32; 3],
+    padding_0: f32,
+    domain_top_right: [f32; 3],
+    padding_1: f32,
+    cell_size: f32,
+    cell_counts: [u32; 3],
+    padding_2: f32,
+}
+
+impl Default for MarchingCubesData {
+    fn default() -> Self {
+        Self {
+            domain_padding: 1.0,
+            vessel_thickness: 1.0,
+            area_size: AREA_SIZE as f32,
+            domain_bottom_left: [-2.0, -2.0, -2.0],
+            padding_0: 0.0,
+            domain_top_right: [AREA_SIZE as f32 + 2.0, AREA_SIZE as f32 + 2.0, 2.0],
+            padding_1: 0.0,
+            cell_size: 40.0,
+            cell_counts: [1; 3],
+            padding_2: 0.0,
+        }
+    }
+}
+
+#[component]
+pub struct MarchingCubesComponent {
+    #[default(false)]
+    execute_compute_step: bool,
+    network_generation_component: Id,
+    mesh_generation_computes: Vec<Id>,
+    #[default((1, 1, 1))]
+    marching_cubes_samples: (u32, u32, u32),
+}
+
+impl MarchingCubesComponent {
+    fn update_buffers(
+        &self,
+        samples_compute: &mut Compute,
+        raw_edge_map: &[[u32; MAX_EDGES_IN_CELL]],
+        raw_edges: &[[[f32; 2]; 2]],
+        parameters: MarchingCubesData,
+        device: &Device,
+        queue: &Queue,
+    ) {
+        let (x, y, z) = self.marching_cubes_samples;
+
+        samples_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(x, y, z));
+
+        for (i, buf) in [
+            bytemuck::cast_slice(&[parameters]),
+            bytemuck::cast_slice(raw_edge_map),
+            bytemuck::cast_slice(raw_edges),
+            bytemuck::cast_slice(&vec![0.0_f32; (x * y * z) as usize]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            samples_compute
+                .update_buffer_attachment(i, buf, device, queue)
+                .unwrap();
+        }
+    }
+
+    fn generate_mesh(
+        &self,
+        computes: &mut [Compute],
+        raw_edge_map: &[[u32; MAX_EDGES_IN_CELL]],
+        raw_edges: &[[[f32; 2]; 2]],
+        parameters: MarchingCubesData,
+        device: &Device,
+        queue: &Queue,
+    ) {
+        let mut computes_to_execute: Vec<&mut Compute> = computes
+            .iter_mut()
+            .filter(|compute| self.mesh_generation_computes.contains(&compute.id()))
+            .collect();
+
+        self.update_buffers(
+            computes_to_execute[0],
+            raw_edge_map,
+            raw_edges,
+            parameters,
+            device,
+            queue,
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::wgt::CommandEncoderDescriptor {
+            label: Some("Marching Cubes Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Marching Cubes Pass"),
+                timestamp_writes: None,
+            });
+
+            for compute in computes_to_execute {
+                Compute::individual_compute_execution(
+                    compute,
+                    device,
+                    queue,
+                    Some(&mut compute_pass),
+                )
+                .unwrap();
+            }
+        }
+
+        queue.submit(Some(encoder.finish()));
+
+        /* let padding = 1.0;
+        let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) =
+            &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
+        let tik = std::time::Instant::now();
+        let marching_cubes = MarchingCubes::new(
+            [
+                Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
+                Vector3::new(
+                    AREA_SIZE as f32 + thickness + padding,
+                    AREA_SIZE as f32 + thickness + padding,
+                    thickness + padding,
+                ),
+            ],
+            &sdf,
+            300,
+            300,
+            12,
+        );
+        let tok = std::time::Instant::now();
+        marching_cubes.march_cubes(0.00001);
+        println!(
+            "Total: {}, grid gen: {}, polygonization: {}",
+            tik.elapsed().as_secs(),
+            (tok - tik).as_secs(),
+            tok.elapsed().as_secs()
+        ); */
+    }
+}
+
+impl ComponentSystem for MarchingCubesComponent {
+    fn initialize(&mut self, _device: &Device) -> ActionQueue {
+        self.set_initialized();
+        vec![Box::new(RegisterUiComponentAction {
+            component_id: self.id,
+            text_component_properties: None,
+        })]
+    }
+
+    fn update(
+        &mut self,
+        UpdateParams {
+            device,
+            queue,
+            other_components,
+            computes,
+            ..
+        }: UpdateParams,
+    ) -> ActionQueue {
+        let Some(network_component) = other_components
+            .iter()
+            .find(|comp| comp.id() == self.network_generation_component)
+            .and_then(|comp| comp.downcast_ref::<NetworkGenerationComponent<StdRng>>())
+        else {
+            return Vec::new();
+        };
+
+        let raw_edge_map = network_component.edge_map().raw_edge_map();
+
+        let raw_edges: Vec<[[f32; 2]; 2]> = network_component
+            .edge_map()
+            .raw_edges()
+            .iter()
+            .map(|[v0, v1]| [[v0.x, v0.y], [v1.x, v1.y]])
+            .collect();
+
+        // if self.execute_compute_step {
+        let parameters = MarchingCubesData {
+            cell_size: network_component.edge_map().cell_size(),
+            cell_counts: network_component.edge_map().cell_counts().map(|v| v as u32),
+            ..Default::default()
+        };
+
+        self.generate_mesh(
+            computes,
+            &raw_edge_map,
+            &raw_edges,
+            parameters,
+            device,
+            queue,
+        );
+        // }
+
+        Vec::new()
+    }
+
+    fn ui_render(&mut self, ctx: &egui::Context) {
+        egui::Area::new("sample counts area".into())
+            .anchor(egui::Align2::RIGHT_TOP, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::dark_canvas(&Default::default()).show(ui, |ui| {
+                    let marching_cubes_x_axis_label = ui.label("Model X-axis samples");
+                    let marching_cubes_x_axis_value = ui.add(
+                        egui::DragValue::new(&mut self.marching_cubes_samples.0).range(2..=512),
+                    );
+                    let marching_cubes_y_axis_label = ui.label("Model Y-axis samples");
+                    let marching_cubes_y_axis_value = ui.add(
+                        egui::DragValue::new(&mut self.marching_cubes_samples.1).range(2..=512),
+                    );
+                    let marching_cubes_z_axis_label = ui.label("Model Z-axis samples");
+                    let marching_cubes_z_axis_value = ui.add(
+                        egui::DragValue::new(&mut self.marching_cubes_samples.2).range(2..=20),
+                    );
+
+                    marching_cubes_x_axis_value.labelled_by(marching_cubes_x_axis_label.id);
+                    marching_cubes_y_axis_value.labelled_by(marching_cubes_y_axis_label.id);
+                    marching_cubes_z_axis_value.labelled_by(marching_cubes_z_axis_label.id);
+
+                    if ui.add(egui::Button::new("Generate STL")).clicked() {
+                        self.execute_compute_step = true;
+                    }
+                });
+            });
+    }
+}
 
 /// My implementation of the marching cubes algorithm as described on
 /// [https://paulbourke.net/geometry/polygonise]. The tables were also sourced from his website.
@@ -179,7 +427,9 @@ impl<'a> MarchingCubes<'a> {
                             })
                             .collect::<Vec<_>>()
                     })
-                }).flat_map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+                })
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
         });
 
         let normals = tris

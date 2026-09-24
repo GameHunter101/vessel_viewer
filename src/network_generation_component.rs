@@ -10,8 +10,10 @@ use v4::{
     component,
     ecs::{
         actions::ActionQueue,
-        component::{Component, ComponentDetails, ComponentId, ComponentSystem, UpdateParams},
+        component::{Component, ComponentDetails, ComponentSystem, UpdateParams},
+        compute::Compute,
         material::{ShaderAttachment, ShaderBufferAttachment},
+        scene::Id,
     },
 };
 use wgpu::{Device, Queue};
@@ -43,9 +45,9 @@ pub struct NetworkGenerationComponent<T> {
     network_parameters: NetworkDetails,
     #[default(40.0)]
     vessel_oxygen_transport_distance: f32,
-    vessel_edges_component: ComponentId,
+    vessel_edges_component: Id,
     // display_vessel_edges_compute: ComponentId,
-    vessel_sdf_material: ComponentId,
+    vessel_sdf_material: Id,
     #[default(vec![Vector3::zeros(); INIT_PROBE_COUNT])]
     probes: Vec<Vector3<f32>>,
 }
@@ -408,33 +410,8 @@ impl<T: Rng + Sync> NetworkGenerationComponent<T> {
             .unwrap()
     }
 
-    fn generate_mesh(&self, thickness: f32) {
-        let padding = 1.0;
-        let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) =
-            &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
-        let tik = std::time::Instant::now();
-        let marching_cubes = MarchingCubes::new(
-            [
-                Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
-                Vector3::new(
-                    AREA_SIZE as f32 + thickness + padding,
-                    AREA_SIZE as f32 + thickness + padding,
-                    thickness + padding,
-                ),
-            ],
-            &sdf,
-            300,
-            300,
-            12,
-        );
-        let tok = std::time::Instant::now();
-        marching_cubes.march_cubes(0.00001);
-        println!(
-            "Total: {}, grid gen: {}, polygonization: {}",
-            tik.elapsed().as_secs(),
-            (tok - tik).as_secs(),
-            tok.elapsed().as_secs()
-        );
+    pub fn edge_map(&self) -> &SpatialEdgeHash {
+        &self.edge_map
     }
 }
 
@@ -466,6 +443,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
             ..
         }: UpdateParams<'_, '_>,
     ) -> ActionQueue {
+
         self.show_gizmo(other_components, engine_details, device, queue);
 
         if self.current_iter >= self.max_iter_count {
@@ -529,9 +507,7 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
         if let Some(component) = other_components
             .iter_mut()
             .find(|comp| comp.id() == self.vessel_edges_component)
-            && let Some(material) = materials
-                .iter_mut()
-                .find(|material| material.id() == self.vessel_sdf_material)
+            && let Some(material) = materials.get_mut(&self.vessel_sdf_material)
             && let ShaderAttachment::Buffer(buf) = &mut material.attachments_mut()[0]
         {
             let mesh_component: &mut MeshComponent<Vertex> = component.downcast_mut().unwrap();
@@ -609,10 +585,6 @@ impl<T: Rng + std::fmt::Debug + Send + Sync + 'static> ComponentSystem
                         );
                     }
 
-                    if ui.add(egui::Button::new("Generate STL")).clicked() {
-                        self.generate_mesh(2.0);
-                    }
-
                     orthogonality_factor_slider.labelled_by(orthogonality_lerp_factor_label.id);
                     branch_width_factor_slider.labelled_by(branch_width_factor_label.id);
                     branch_length_factor_slider.labelled_by(branch_length_factor_label.id);
@@ -638,6 +610,7 @@ pub fn points_are_close(p1: Vector3<f32>, p2: Vector3<f32>) -> bool {
 mod test {
     use nalgebra::Vector3;
     use rand::{SeedableRng, rng};
+    use v4::ecs::scene::Id;
 
     use crate::{
         AREA_SIZE,
@@ -655,16 +628,16 @@ mod test {
                     (Vector3::new(p[0], p[1], 0.0) + Vector3::new(1.0, 1.0, 0.0)) * AREA_SIZE as f32
                         / 2.0
                 })],
-                [AREA_SIZE as f32, AREA_SIZE as f32, 40.0]
+                [AREA_SIZE as f32, AREA_SIZE as f32, 40.0],
             ))
             .network_parameters(crate::network_generation_component::NetworkDetails {
                 edge_orthogonality_lerp_factor: 0.0,
                 branch_length_factor: 0.5,
                 branch_width_factor: 0.5,
             })
-            .vessel_edges_component(0)
+            .vessel_edges_component(Id::nil())
             // .display_vessel_edges_compute(0)
-            .vessel_sdf_material(0)
+            .vessel_sdf_material(Id::nil())
             .max_iter_count(0)
             .build();
 
@@ -703,9 +676,9 @@ mod test {
                 branch_length_factor: 0.5,
                 branch_width_factor: 0.5,
             })
-            .vessel_edges_component(0)
+            .vessel_edges_component(Id::nil())
             // .display_vessel_edges_compute(0)
-            .vessel_sdf_material(0)
+            .vessel_sdf_material(Id::nil())
             .max_iter_count(0)
             .build();
         let test_point = Vector3::new(89.0, 426.0, 0.0);
@@ -742,9 +715,9 @@ mod test {
                 branch_length_factor: 0.5,
                 branch_width_factor: 0.5,
             })
-            .vessel_edges_component(0)
+            .vessel_edges_component(Id::nil())
             // .display_vessel_edges_compute(0)
-            .vessel_sdf_material(0)
+            .vessel_sdf_material(Id::nil())
             .max_iter_count(0)
             .build();
 

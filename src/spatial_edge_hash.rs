@@ -6,7 +6,10 @@ use std::{
 use egui::emath::OrderedFloat;
 use nalgebra::{Vector2, Vector3};
 
-use crate::network_generation_component::{points_are_close, vector_project};
+use crate::{
+    MAX_EDGES_IN_CELL,
+    network_generation_component::{points_are_close, vector_project},
+};
 
 pub type Edge = [Vector3<f32>; 2];
 
@@ -56,7 +59,9 @@ impl SpatialEdgeHash {
     }
 
     fn cell_to_index(&self, cell: Vector3<u32>) -> usize {
-        self.cell_counts[0] * self.cell_counts[1] * cell.z as usize + self.cell_counts[0] * cell.y as usize + cell.x as usize
+        self.cell_counts[0] * self.cell_counts[1] * cell.z as usize
+            + self.cell_counts[0] * cell.y as usize
+            + cell.x as usize
     }
 
     fn floor_point_to_grid(&self, point: Vector3<f32>) -> Vector3<u32> {
@@ -392,6 +397,20 @@ impl SpatialEdgeHash {
             .collect()
     }
 
+    pub fn raw_edge_map(&self) -> Vec<[u32; MAX_EDGES_IN_CELL]> {
+        self.map
+            .iter()
+            .flat_map(|cell| {
+                let arr: Vec<u32> = cell.iter().map(|val| *val as u32).collect();
+                (0..MAX_EDGES_IN_CELL)
+                    .map(|i| *arr.get(i).unwrap_or(&u32::MAX))
+                    .collect::<Vec<_>>()
+                    .as_array::<MAX_EDGES_IN_CELL>()
+                    .copied()
+            })
+            .collect()
+    }
+
     pub fn edge_indices(&self) -> &[[usize; 2]] {
         &self.edge_indices
     }
@@ -416,6 +435,14 @@ impl SpatialEdgeHash {
 
     pub fn barrier_edges(&self) -> &[Edge] {
         &self.barrier_edges
+    }
+
+    pub fn map_len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn cell_counts(&self) -> [usize; 3] {
+        self.cell_counts
     }
 }
 
@@ -498,7 +525,7 @@ mod test {
         let edge_hash = SpatialEdgeHash::new(
             0.5,
             vec![[Vector3::new(0.5, 0.5, 0.5), Vector3::new(0.9, 0.8, 0.7)]],
-            [1.5; 3]
+            [1.5; 3],
         );
 
         assert_eq!(edge_hash.occupied_cells(), 1);
@@ -510,7 +537,7 @@ mod test {
         let mut edge_hash = SpatialEdgeHash::new(
             0.5,
             vec![[Vector3::new(0.1, 0.1, 0.0), Vector3::new(0.6, 0.1, 0.0)]],
-            [1.5; 3]
+            [1.5; 3],
         );
 
         edge_hash.split_edge_at_point(0, Vector3::new(0.3, 0.1, 0.0));
@@ -528,8 +555,11 @@ mod test {
 
     #[test]
     fn complex_edge_split() {
-        let mut edge_hash =
-            SpatialEdgeHash::new(1.0, vec![[Vector3::zeros(), Vector3::new(2.9, 2.4, 0.0)]], [4.0; 3]);
+        let mut edge_hash = SpatialEdgeHash::new(
+            1.0,
+            vec![[Vector3::zeros(), Vector3::new(2.9, 2.4, 0.0)]],
+            [4.0; 3],
+        );
 
         edge_hash.split_edge_at_point(0, Vector3::new(1.85, 1.53, 0.0));
 

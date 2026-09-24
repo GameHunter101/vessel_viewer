@@ -1,15 +1,15 @@
 const BUFFER_SIZE: usize = 2048;
 const AREA_SIZE: usize = 512;
+const MAX_EDGES_IN_CELL: usize = 16;
 
 use image::EncodableLayout;
 use nalgebra::Vector3;
 use rand::{SeedableRng, rngs::StdRng};
 use v4::{
     V4,
-    builtin_components::{camera_component::CameraComponent, mesh_component::{MeshComponent, VertexData, VertexDescriptor}},
-    ecs::{
-        compute::Compute,
-        material::{ShaderAttachment, ShaderBufferAttachment, ShaderTextureAttachment},
+    builtin_components::{
+        camera_component::CameraComponent,
+        mesh_component::{MeshComponent, VertexData, VertexDescriptor},
     },
     engine_support::texture_support::{TextureBundle, TextureProperties},
     scene,
@@ -18,13 +18,12 @@ use wgpu::vertex_attr_array;
 use winit::window::WindowAttributes;
 
 use crate::{
-    network_generation_component::{NetworkDetails, NetworkGenerationComponent},
-    spatial_edge_hash::{Edge, SpatialEdgeHash},
+    marching_cubes::{MarchingCubesComponent, MarchingCubesData}, network_generation_component::{NetworkDetails, NetworkGenerationComponent}, spatial_edge_hash::{Edge, SpatialEdgeHash}
 };
 
+mod marching_cubes;
 mod network_generation_component;
 mod spatial_edge_hash;
-mod marching_cubes;
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +36,8 @@ async fn main() {
             winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(800, 800)),
         ))
         .build()
-        .await.unwrap();
+        .await
+        .unwrap();
 
     let rendering_manager = engine.rendering_manager();
     let device = rendering_manager.device();
@@ -62,7 +62,7 @@ async fn main() {
         .chain([ComputeEdge::default(); BUFFER_SIZE - 2])
         .collect();
 
-    let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0, 0.0, 0.0, 1.0]));
+    /* let img = image::Rgba32FImage::from_pixel(512, 512, image::Rgba([0.0, 0.0, 0.0, 1.0]));
     let bytes = img.as_bytes();
 
     let (oxygen_concentration_texture, oxygen_concentration_texture_bundle) =
@@ -78,7 +78,8 @@ async fn main() {
                 extra_usages: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
 
     let oxygen_concentration_display_texture_bundle = TextureBundle::new(
         oxygen_concentration_texture.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -87,10 +88,21 @@ async fn main() {
             is_filtered: false,
             ..Default::default()
         },
-    );
+    ); */
 
-    scene! {
-        scene: vessel_viewer,
+    let oxygen_saturation_distance = 40.0;
+    let edge_map = SpatialEdgeHash::new(
+        oxygen_saturation_distance,
+        boundary,
+        [
+            AREA_SIZE as f32,
+            AREA_SIZE as f32,
+            oxygen_saturation_distance,
+        ],
+    );
+    let map_len = edge_map.map_len();
+
+    let vessel_viewer = scene! {
         /* active_camera: "cam_comp",
         "cam" = {
             components: [
@@ -98,31 +110,31 @@ async fn main() {
             ]
         }, */
         "oxygen_concentration" = {
-            material: {
-                pipeline: {
-                    vertex_shader_path: "shaders/oxygen_display_vertex.wgsl",
+            material: Material {
+                pipeline: Pipeline {
+                    vertex_shader: "shaders/oxygen_display_vertex.wgsl",
                     // fragment_shader_path: "shaders/oxygen_display_fragment.wgsl",
-                    fragment_shader_path: "shaders/sdf_fragment.wgsl",
+                    fragment_shader: "shaders/sdf_fragment.wgsl",
                     uses_camera: false,
-                    vertex_layouts: [DisplayVertex::vertex_layout()],
+                    vertex_layouts: vec![DisplayVertex::vertex_layout()],
                 },
                 attachments: [
                     /* Texture(
                         texture_bundle: oxygen_concentration_display_texture_bundle,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                     ) */
-                    Buffer(
+                    Buffer {
                         device: device,
                         data: bytemuck::cast_slice(&oxygen_compute_edges),
                         buffer_type: wgpu::BufferBindingType::Uniform,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    )
+                    }
                 ],
-                ident: "sdf_mat"
+                ID: "sdf_mat"
             },
             components: [
-                MeshComponent(
+                MeshComponent {
                     vertices: vec![vec![
                         DisplayVertex {
                             pos: [-1.0, 3.0, 0.1],
@@ -138,11 +150,11 @@ async fn main() {
                         },
                     ]],
                     enabled_models: vec![(0, None)]
-                ),
-                NetworkGenerationComponent(
+                },
+                NetworkGenerationComponent {
                     rng: StdRng::seed_from_u64(0),
-                    edge_map: SpatialEdgeHash::new(60.0, boundary, [AREA_SIZE as f32, AREA_SIZE as f32, 60.0]),
-                    vessel_oxygen_transport_distance: 40.0,
+                    edge_map,
+                    vessel_oxygen_transport_distance: oxygen_saturation_distance,
                     max_iter_count: 1,
                     network_parameters: NetworkDetails {
                         edge_orthogonality_lerp_factor: 0.0,
@@ -151,56 +163,98 @@ async fn main() {
                         branch_width_factor: 0.3,
                         branch_length_factor: 0.7,
                     },
-                    vessel_edges_component: ident("vessel_edges"),
-                    vessel_sdf_material: ident("sdf_mat")
+                    vessel_edges_component: ID!("vessel_edges"),
+                    vessel_sdf_material: ID!("sdf_mat"),
                     // display_vessel_edges_compute: ident("vessel_compute"),
-                )
+                    ID: "network_gen"
+                },
+                MarchingCubesComponent {
+                    network_generation_component: ID!("network_gen"),
+                    mesh_generation_computes: vec![ID!("marching_cubes_grid")],
+                }
             ],
-            /* computes: [Compute(
+            computes: [
+                /* Compute(
                     attachments: vec![
-                        ShaderAttachment::Buffer(ShaderBufferAttachment::new(
+                    ShaderAttachment::Buffer(ShaderBufferAttachment::new(
                             device,
                             bytemuck::cast_slice(&oxygen_compute_edges),
                             wgpu::BufferBindingType::Uniform,
                             wgpu::ShaderStages::COMPUTE,
                             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        )),
-                        ShaderAttachment::Texture(ShaderTextureAttachment {
-                            texture_bundle: oxygen_concentration_texture_bundle.clone(),
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                        }),
+                    )),
+                    ShaderAttachment::Texture(ShaderTextureAttachment {
+                        texture_bundle: oxygen_concentration_texture_bundle.clone(),
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                    }),
                     ],
-                shader_path: "shaders/oxygen_compute.wgsl",
-                workgroup_counts: v4::ecs::compute::WorkgroupCounts::Static(512, 512, 1),
-                ident: "vessel_compute"
-            )], */
+                    shader_path: "shaders/oxygen_compute.wgsl",
+                    workgroup_counts: v4::ecs::compute::WorkgroupCounts::Static(512, 512, 1),
+                    ident: "vessel_compute"
+                ) */
+                Compute {
+                    attachments: [
+                        Buffer {
+                            device,
+                            data: bytemuck::cast_slice(&[MarchingCubesData::default()]),
+                            buffer_type: wgpu::BufferBindingType::Uniform,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        },
+                        Buffer {
+                            device,
+                            data: &vec![0; map_len * 4 * MAX_EDGES_IN_CELL],
+                            buffer_type: wgpu::BufferBindingType::Storage { read_only: true },
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            extra_usages: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        },
+                        Buffer {
+                            device,
+                            data: bytemuck::cast_slice(&oxygen_compute_edges),
+                            buffer_type: wgpu::BufferBindingType::Uniform,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        },
+                        Buffer {
+                            device,
+                            data: bytemuck::cast_slice(&[0.0_f32, 0.0_f32]), // Adjusted by the network generation component to hold proper number of samples
+                            buffer_type: wgpu::BufferBindingType::Storage { read_only: false },
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            extra_usages: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        }
+                    ],
+                    shader_path: "shaders/marching_cubes_grid.wgsl",
+                    workgroup_counts: v4::ecs::compute::WorkgroupCounts::Static(1, 1, 1), // Adjusted by the network generation component
+                    ID: "marching_cubes_grid"
+                }
+            ],
         },
         "vessels" = {
-            material: {
-                pipeline: {
-                    vertex_shader_path: "shaders/vessel_vertex.wgsl",
-                    fragment_shader_path: "shaders/vessel_fragment.wgsl",
+            material: Material {
+                pipeline: Pipeline {
+                    vertex_shader: "shaders/vessel_vertex.wgsl",
+                    fragment_shader: "shaders/vessel_fragment.wgsl",
                     uses_camera: false,
-                    vertex_layouts: [Vertex::vertex_layout()],
-                    geometry_details: {
+                    vertex_layouts: vec![Vertex::vertex_layout()],
+                    geometry_details: GeometryDetails {
                         topology: wgpu::PrimitiveTopology::LineList,
                         polygon_mode: wgpu::PolygonMode::Line,
                     }
                 }
             },
             components: [
-                MeshComponent(
+                MeshComponent {
                     vertices: vec![vessels],
                     enabled_models: vec![(0, None)],
-                    ident: "vessel_edges",
-                )
+                    ID: "vessel_edges",
+                }
             ],
         }
-    }
+    };
 
     engine.attach_scene(vessel_viewer);
 
-    engine.main_loop().await;
+    engine.main_loop().await.unwrap();
 }
 
 #[repr(C)]
@@ -284,12 +338,12 @@ pub fn initialize_points() -> (Vec<Vertex>, Vec<Edge>) {
         },
         Vertex {
             pos: [1.0, 0.0, 0.0],
-            color: [1.0, 0.0, 1.0, 1.0]
+            color: [1.0, 0.0, 1.0, 1.0],
         },
         Vertex {
             pos: [-1.0, 0.0, 0.0],
-            color: [1.0, 0.0, 1.0, 1.0]
-        }
+            color: [1.0, 0.0, 1.0, 1.0],
+        },
     ];
 
     let boundary: Vec<Vector3<f32>> = vessels
