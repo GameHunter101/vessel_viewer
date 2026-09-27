@@ -16,6 +16,7 @@ use wgpu::{Device, Queue};
 
 use crate::{
     AREA_SIZE, MAX_EDGES_IN_CELL, network_generation_component::NetworkGenerationComponent,
+    spatial_edge_hash::SpatialEdgeHash,
 };
 
 #[repr(C)]
@@ -24,10 +25,10 @@ pub struct MarchingCubesData {
     domain_padding: f32,
     vessel_thickness: f32,
     area_size: f32,
-    domain_bottom_left: [f32; 3],
     padding_0: f32,
-    domain_top_right: [f32; 3],
+    domain_bottom_left: [f32; 3],
     padding_1: f32,
+    domain_top_right: [f32; 3],
     cell_size: f32,
     cell_counts: [u32; 3],
     padding_2: f32,
@@ -39,10 +40,10 @@ impl Default for MarchingCubesData {
             domain_padding: 1.0,
             vessel_thickness: 1.0,
             area_size: AREA_SIZE as f32,
-            domain_bottom_left: [-2.0, -2.0, -2.0],
             padding_0: 0.0,
-            domain_top_right: [AREA_SIZE as f32 + 2.0, AREA_SIZE as f32 + 2.0, 2.0],
+            domain_bottom_left: [-2.0, -2.0, -2.0],
             padding_1: 0.0,
+            domain_top_right: [AREA_SIZE as f32 + 2.0, AREA_SIZE as f32 + 2.0, 2.0],
             cell_size: 40.0,
             cell_counts: [1; 3],
             padding_2: 0.0,
@@ -87,6 +88,37 @@ impl MarchingCubesComponent {
                 .update_buffer_attachment(i, buf, device, queue)
                 .unwrap();
         }
+    }
+
+    fn vessel_sdf(edge_map: &SpatialEdgeHash, point: Vector3<f32>, thickness: f32) -> f32 {
+        let nearby_edges = edge_map.edges_in_cells_near_point(point);
+
+        let vector_min = |a: Vector3<f32>, b: Vector3<f32>| {
+            Vector3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
+        };
+        let vector_max = |a: Vector3<f32>, b: Vector3<f32>| {
+            Vector3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
+        };
+        // nearby_edges.iter().last().map(|x| *x as f32).unwrap_or(f32::INFINITY)
+        // edge_map.temp(point)
+
+        nearby_edges
+            .into_iter()
+            .map(|edge_index| {
+                let [a, b] = edge_map.edge(edge_index);
+                let projection =
+                    crate::network_generation_component::vector_project(b - a, point - a) + a;
+
+                let min_point = vector_min(a, b);
+                let max_point = vector_max(a, b);
+                let clamped_projection = vector_max(vector_min(projection, max_point), min_point);
+
+                let dist = clamped_projection - point;
+
+                dist.dot(&dist) - thickness * thickness
+            })
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(f32::INFINITY)
     }
 
     fn generate_mesh(
@@ -135,17 +167,16 @@ impl MarchingCubesComponent {
 
         queue.submit(Some(encoder.finish()));
 
-        /* let padding = 1.0;
-        let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) =
-            &move |point: Vector3<f32>| self.vessel_sdf(point, thickness);
-        let tik = std::time::Instant::now();
+        /* let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) =
+            &move |point: Vector3<f32>| Self::vessel_sdf(edge_map, point, parameters.vessel_thickness);
+        // let tik = std::time::Instant::now();
         let marching_cubes = MarchingCubes::new(
             [
-                Vector3::new(-1.0, -1.0, -1.0) * (thickness + padding),
+                Vector3::new(-1.0, -1.0, -1.0) * (parameters.vessel_thickness + parameters.domain_padding),
                 Vector3::new(
-                    AREA_SIZE as f32 + thickness + padding,
-                    AREA_SIZE as f32 + thickness + padding,
-                    thickness + padding,
+                    AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
+                    AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
+                    parameters.vessel_thickness + parameters.domain_padding,
                 ),
             ],
             &sdf,
@@ -153,6 +184,7 @@ impl MarchingCubesComponent {
             300,
             12,
         );
+        println!("{:?}", marching_cubes.samples);
         let tok = std::time::Instant::now();
         marching_cubes.march_cubes(0.00001);
         println!(
@@ -160,7 +192,7 @@ impl MarchingCubesComponent {
             tik.elapsed().as_secs(),
             (tok - tik).as_secs(),
             tok.elapsed().as_secs()
-        ); */
+        ) */
     }
 }
 
@@ -215,7 +247,37 @@ impl ComponentSystem for MarchingCubesComponent {
             device,
             queue,
         );
-        // }
+
+        if self.execute_compute_step {
+            let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) = &move |point: Vector3<f32>| {
+                Self::vessel_sdf(
+                    network_component.edge_map(),
+                    point,
+                    parameters.vessel_thickness,
+                )
+            };
+            // let tik = std::time::Instant::now();
+            let marching_cubes = MarchingCubes::new(
+                [
+                    Vector3::new(-1.0, -1.0, -1.0)
+                        * (parameters.vessel_thickness + parameters.domain_padding),
+                    Vector3::new(
+                        AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
+                        AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
+                        parameters.vessel_thickness + parameters.domain_padding,
+                    ),
+                ],
+                &sdf,
+                self.marching_cubes_samples.0 as usize,
+                self.marching_cubes_samples.1 as usize,
+                self.marching_cubes_samples.2 as usize,
+                /* 300,
+                300,
+                12, */
+            );
+            println!("{:?}", marching_cubes.samples);
+            self.execute_compute_step = false;
+        }
 
         Vec::new()
     }

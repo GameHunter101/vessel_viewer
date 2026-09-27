@@ -203,7 +203,7 @@ async fn main() {
                         },
                         Buffer {
                             device,
-                            data: &vec![0; map_len * 4 * MAX_EDGES_IN_CELL],
+                            data: bytemuck::cast_slice(&vec![0.0_f32; map_len * MAX_EDGES_IN_CELL]),
                             buffer_type: wgpu::BufferBindingType::Storage { read_only: true },
                             visibility: wgpu::ShaderStages::COMPUTE,
                             extra_usages: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,

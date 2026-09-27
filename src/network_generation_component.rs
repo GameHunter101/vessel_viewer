@@ -382,34 +382,6 @@ impl<T: Rng + Sync> NetworkGenerationComponent<T> {
         }
     }
 
-    fn vessel_sdf(&self, point: Vector3<f32>, thickness: f32) -> f32 {
-        let nearby_edges = self.edge_map.edges_in_cells_near_point(point);
-
-        let vector_min = |a: Vector3<f32>, b: Vector3<f32>| {
-            Vector3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
-        };
-        let vector_max = |a: Vector3<f32>, b: Vector3<f32>| {
-            Vector3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
-        };
-
-        nearby_edges
-            .into_iter()
-            .map(|edge_index| {
-                let [a, b] = self.edge_map.edge(edge_index);
-                let projection = vector_project(b - a, point - a) + a;
-
-                let min_point = vector_min(a, b);
-                let max_point = vector_max(a, b);
-                let clamped_projection = vector_max(vector_min(projection, max_point), min_point);
-
-                let dist = clamped_projection - point;
-
-                dist.dot(&dist) - thickness * thickness
-            })
-            .min_by(|a, b| a.total_cmp(b))
-            .unwrap()
-    }
-
     pub fn edge_map(&self) -> &SpatialEdgeHash {
         &self.edge_map
     }
