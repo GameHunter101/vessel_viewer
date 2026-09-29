@@ -64,7 +64,7 @@ pub struct MarchingCubesComponent {
 impl MarchingCubesComponent {
     fn update_buffers(
         &self,
-        samples_compute: &mut Compute,
+        computes: &mut [&mut Compute],
         raw_edge_map: &[[u32; MAX_EDGES_IN_CELL]],
         raw_edges: &[[[f32; 2]; 2]],
         parameters: MarchingCubesData,
@@ -72,6 +72,8 @@ impl MarchingCubesComponent {
         queue: &Queue,
     ) {
         let (x, y, z) = self.marching_cubes_samples;
+
+        let samples_compute = &mut computes[0];
 
         samples_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(x, y, z));
 
@@ -88,6 +90,18 @@ impl MarchingCubesComponent {
                 .update_buffer_attachment(i, buf, device, queue)
                 .unwrap();
         }
+
+        let mesh_compute = &mut computes[1];
+
+        mesh_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(x, y, z));
+        mesh_compute
+            .update_buffer_attachment(
+                2,
+                bytemuck::cast_slice(&vec![0.0_f32; (x * y * z) as usize * 15]),
+                device,
+                queue,
+            )
+            .unwrap();
     }
 
     fn vessel_sdf(edge_map: &SpatialEdgeHash, point: Vector3<f32>, thickness: f32) -> f32 {
@@ -136,7 +150,7 @@ impl MarchingCubesComponent {
             .collect();
 
         self.update_buffers(
-            computes_to_execute[0],
+            &mut computes_to_execute,
             raw_edge_map,
             raw_edges,
             parameters,
@@ -275,7 +289,8 @@ impl ComponentSystem for MarchingCubesComponent {
                 300,
                 12, */
             );
-            println!("{:?}", marching_cubes.samples);
+            marching_cubes.march_cubes(0.00001);
+            // println!("{:?}", marching_cubes.samples);
             self.execute_compute_step = false;
         }
 
@@ -494,7 +509,11 @@ impl<'a> MarchingCubes<'a> {
                 .collect::<Vec<_>>()
         });
 
-        let normals = tris
+        for row in tris {
+            println!("{row:?}");
+        }
+
+        /* let normals = tris
             .iter()
             .map(|tri| (tri[1] - tri[0]).cross(&(tri[2] - tri[0])).normalize())
             .collect::<Vec<_>>();
@@ -525,7 +544,7 @@ impl<'a> MarchingCubes<'a> {
                 )
             })
             .collect();
-        obj.write_all(&faces_str.into_bytes()).unwrap();
+        obj.write_all(&faces_str.into_bytes()).unwrap(); */
     }
 }
 

@@ -11,6 +11,10 @@ use v4::{
         camera_component::CameraComponent,
         mesh_component::{MeshComponent, VertexData, VertexDescriptor},
     },
+    ecs::{
+        compute::WorkgroupCounts,
+        material::BufferBundle
+    },
     engine_support::texture_support::{TextureBundle, TextureProperties},
     scene,
 };
@@ -18,7 +22,9 @@ use wgpu::vertex_attr_array;
 use winit::window::WindowAttributes;
 
 use crate::{
-    marching_cubes::{MarchingCubesComponent, MarchingCubesData}, network_generation_component::{NetworkDetails, NetworkGenerationComponent}, spatial_edge_hash::{Edge, SpatialEdgeHash}
+    marching_cubes::{MarchingCubesComponent, MarchingCubesData},
+    network_generation_component::{NetworkDetails, NetworkGenerationComponent},
+    spatial_edge_hash::{Edge, SpatialEdgeHash},
 };
 
 mod marching_cubes;
@@ -102,6 +108,19 @@ async fn main() {
     );
     let map_len = edge_map.map_len();
 
+    let marching_cubes_params_buf = BufferBundle::new(
+        device,
+        bytemuck::cast_slice(&[MarchingCubesData::default()]),
+        wgpu::BufferBindingType::Uniform,
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    );
+    let marching_cubes_samples_buf = BufferBundle::new(
+        device,
+        bytemuck::cast_slice(&[0.0_f32, 0.0_f32]), // Adjusted by the network generation component to hold proper number of samples
+        wgpu::BufferBindingType::Storage { read_only: false },
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    );
+
     let vessel_viewer = scene! {
         /* active_camera: "cam_comp",
         "cam" = {
@@ -124,11 +143,13 @@ async fn main() {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                     ) */
                     Buffer {
-                        device: device,
-                        data: bytemuck::cast_slice(&oxygen_compute_edges),
-                        buffer_type: wgpu::BufferBindingType::Uniform,
+                        buffer: BufferBundle::new(
+                            device,
+                            bytemuck::cast_slice(&oxygen_compute_edges),
+                            wgpu::BufferBindingType::Uniform,
+                            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        ),
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     }
                 ],
                 ID: "sdf_mat"
@@ -170,7 +191,7 @@ async fn main() {
                 },
                 MarchingCubesComponent {
                     network_generation_component: ID!("network_gen"),
-                    mesh_generation_computes: vec![ID!("marching_cubes_grid")],
+                    mesh_generation_computes: vec![ID!("marching_cubes_grid"), ID!("marching_cubes_mesh")],
                 }
             ],
             computes: [
@@ -194,38 +215,62 @@ async fn main() {
                 ) */
                 Compute {
                     attachments: [
-                        Buffer {
-                            device,
-                            data: bytemuck::cast_slice(&[MarchingCubesData::default()]),
-                            buffer_type: wgpu::BufferBindingType::Uniform,
+                        Buffer { // Parameters
+                            buffer: marching_cubes_params_buf.clone(),
                             visibility: wgpu::ShaderStages::COMPUTE,
-                            extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         },
-                        Buffer {
-                            device,
-                            data: bytemuck::cast_slice(&vec![0.0_f32; map_len * MAX_EDGES_IN_CELL]),
-                            buffer_type: wgpu::BufferBindingType::Storage { read_only: true },
+                        Buffer { // Edges map
+                            buffer: BufferBundle::new(
+                                device,
+                                bytemuck::cast_slice(&vec![0.0_f32; map_len * MAX_EDGES_IN_CELL]),
+                                wgpu::BufferBindingType::Storage { read_only: true },
+                                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            ),
                             visibility: wgpu::ShaderStages::COMPUTE,
-                            extra_usages: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                         },
-                        Buffer {
-                            device,
-                            data: bytemuck::cast_slice(&oxygen_compute_edges),
-                            buffer_type: wgpu::BufferBindingType::Uniform,
+                        Buffer { // Vessels
+                            buffer: BufferBundle::new(
+                                device,
+                                bytemuck::cast_slice(&oxygen_compute_edges),
+                                wgpu::BufferBindingType::Uniform,
+                                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            ),
                             visibility: wgpu::ShaderStages::COMPUTE,
-                            extra_usages: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         },
-                        Buffer {
-                            device,
-                            data: bytemuck::cast_slice(&[0.0_f32, 0.0_f32]), // Adjusted by the network generation component to hold proper number of samples
-                            buffer_type: wgpu::BufferBindingType::Storage { read_only: false },
+                        Buffer { // Samples
+                            buffer: marching_cubes_samples_buf.clone(),
                             visibility: wgpu::ShaderStages::COMPUTE,
-                            extra_usages: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                         }
                     ],
+                    continuous_execution: false,
                     shader_path: "shaders/marching_cubes_grid.wgsl",
-                    workgroup_counts: v4::ecs::compute::WorkgroupCounts::Static(1, 1, 1), // Adjusted by the network generation component
+                    workgroup_counts: WorkgroupCounts::Static(1, 1, 1), // Adjusted by the network generation component
                     ID: "marching_cubes_grid"
+                },
+                Compute {
+                    attachments: [
+                        Buffer { // Parameters
+                            buffer: marching_cubes_params_buf,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                        },
+                        Buffer { // Samples
+                            buffer: marching_cubes_samples_buf,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                        },
+                        Buffer { // Vertices
+                            buffer: BufferBundle::new(
+                                device,
+                                bytemuck::cast_slice(&[0.0_f32; 45]),
+                                wgpu::BufferBindingType::Storage { read_only: false },
+                                wgpu::BufferUsages::COPY_DST
+                            ),
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                        }
+                    ],
+                    shader_path: "shaders/marching_cubes_mesh_gen.wgsl",
+                    continuous_execution: false,
+                    workgroup_counts: WorkgroupCounts::Static(1, 1, 1), // Adjusted by the network generation component
+                    ID: "marching_cubes_mesh"
                 }
             ],
         },

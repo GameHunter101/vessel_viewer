@@ -36,9 +36,6 @@ fn sdf_point(pos: vec3<f32>) -> f32 {
     for (var x = -1; x <= 1; x++) {
         for (var y = -1; y <= 1; y++) {
             for (var z = -1; z <= 1; z++) {
-                // let x = -1;
-                // let y = -1;
-                // let z = -1;
                 let cell_to_check = max(vec3i(grid_pos) + vec3i(x, y, z), vec3i(0));
                 let index = min(max(0, cell_to_index(vec3u(cell_to_check))), arrayLength(&edges_map));
                 let nearby_edges = edges_map[index];
@@ -57,7 +54,6 @@ fn sdf_point(pos: vec3<f32>) -> f32 {
 
                     let dist = clamped_projection - pos;
 
-                    // sample = f32(nearby_edges[i]);
                     sample = min(sample, dot(dist, dist) - parameters.thickness * parameters.thickness);
                 }
             }
