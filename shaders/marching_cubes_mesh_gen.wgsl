@@ -2,6 +2,11 @@
 @group(0) @binding(1) var<storage, read_write> samples: array<f32>;
 @group(0) @binding(2) var<storage, read_write> triangles: array<array<f32, 45>>;
 
+fn INF() -> f32 {
+    let temp = bitcast<f32>(0x7f800000u);
+    return temp;
+}
+
 struct MarchingCubesParameters {
     padding: f32,
     thickness: f32,
@@ -11,6 +16,116 @@ struct MarchingCubesParameters {
     cell_size: f32,
     cell_counts: vec3<u32>,
 }
+
+fn index_samples(pos: vec3<u32>, sample_counts: vec3<u32>) -> u32 {
+    return pos.z * (sample_counts.x * sample_counts.y) + pos.y * sample_counts.x + pos.x;
+}
+
+// Each bit of the returned value describes whether its equivalent corner is inside or outside the SDF
+fn calculate_cube_index(cube: array<f32, 8>, surface_threshold: f32) -> u32 {
+    var sum = 0u;
+    for (var i = 0u; i < 8; i++) {
+        sum += (1u << i) * u32(cube[i] < surface_threshold);
+    }
+
+    return sum;
+}
+
+fn calculate_triangles(
+    id: vec3<u32>,
+    normalize_vector: vec3<f32>,
+    cube_vertices: array<vec3<f32>, 8>,
+    sample_counts: vec3<u32>,
+) -> array<f32, 45> {
+    let cube_bottom_left = vec3f(f32(id.x), f32(id.y), f32(id.z)) * normalize_vector + parameters.domain_bl;
+
+    var cube_samples = array<f32, 8>();
+
+    for (var i = 0; i < 8; i++) {
+        cube_samples[i] = samples[index_samples(id + vec3u(cube_vertices[i]), sample_counts)];
+    }
+
+    let surface_threshold = 0.00001;
+
+    let cube_index = calculate_cube_index(cube_samples, surface_threshold);
+
+    let vertices_of_edges = array(
+        vec2u(0, 1),
+        vec2u(1, 2),
+        vec2u(2, 3),
+        vec2u(0, 3),
+        vec2u(4, 5),
+        vec2u(5, 6),
+        vec2u(6, 7),
+        vec2u(4, 7),
+        vec2u(0, 4),
+        vec2u(1, 5),
+        vec2u(2, 6),
+        vec2u(3, 7),
+    );
+
+    var position_offsets = array<vec3<f32>, 8>();
+
+    for (var i = 0; i < 8; i++) {
+        position_offsets[i] = cube_vertices[i] * normalize_vector;
+    }
+
+    var points = array<vec3<f32>, 12>();
+    for (var edge = 0; edge < 12; edge++) {
+        let edge_pos = array(
+            cube_bottom_left + position_offsets[vertices_of_edges[edge].x],
+            cube_bottom_left + position_offsets[vertices_of_edges[edge].y],
+        );
+
+        let edge_sdf = vec2f(cube_samples[vertices_of_edges[edge].x], cube_samples[vertices_of_edges[edge].y]);
+        points[edge] = edge_pos[0] - edge_sdf.x * (edge_pos[1] - edge_pos[0]) / (edge_sdf.y - edge_sdf.x);
+    }
+
+    var triangles = array<f32, 45>();
+
+    var count = 0;
+    for (var i = 0; i < 15; i++) {
+        let vert_idx = TRIANGLE_TABLE[cube_index][i];
+        let is_valid = f32(vert_idx != -1);
+        let point = is_valid * points[vert_idx] + (1.0 - is_valid) * vec3f(0x7f800000); // Infinity if the vertex is not valid
+        triangles[3 * i] = point.x;
+        triangles[3 * i + 1] = point.y;
+        triangles[3 * i + 2] = point.z;
+    }
+
+    /* var triangles = array<f32, 45>();
+
+    triangles[0] = f32(id.x);
+    triangles[1] = f32(id.y);
+    triangles[2] = f32(id.z);
+    triangles[3] = f32(cube_index); */
+
+    return triangles;
+}
+
+@compute
+@workgroup_size(1)
+fn main(@builtin(workgroup_id) id: vec3<u32>, @builtin(num_workgroups) raw_sample_counts: vec3<u32>) {
+    let sample_counts = raw_sample_counts + vec3(1);
+
+    let domain_diff = parameters.domain_tr - parameters.domain_bl;
+    let normalize_vector = domain_diff
+        / vec3f(f32(sample_counts.x - 1), f32(sample_counts.y - 1), f32(sample_counts.z - 1));
+
+    let cube_vertices = array(
+        vec3f(0.0, 0.0, 0.0),
+        vec3f(1.0, 0.0, 0.0),
+        vec3f(1.0, 1.0, 0.0),
+        vec3f(0.0, 1.0, 0.0),
+        vec3f(0.0, 0.0, 1.0),
+        vec3f(1.0, 0.0, 1.0),
+        vec3f(1.0, 1.0, 1.0),
+        vec3f(0.0, 1.0, 1.0),
+    );
+
+    triangles[index_samples(id, raw_sample_counts)] = calculate_triangles(id, normalize_vector, cube_vertices, sample_counts);
+}
+
 
 /// Each value is an array describing how triangles should be generated for any cube. There are
 /// maximum 5 triangles that can be generated. Each value in the subarray is the index of an edge.
@@ -274,102 +389,3 @@ const TRIANGLE_TABLE = array(
     array(0, 3, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
     array(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
 );
-
-fn index_samples(pos: vec3<u32>, sample_counts: vec3<u32>) -> u32 {
-    return pos.z * (sample_counts.x * sample_counts.y) + pos.y * sample_counts.x + pos.x;
-}
-
-// Each bit of the returned value describes whether its equivalent corner is inside or outside the SDF
-fn calculate_cube_index(cube: array<f32, 8>, surface_threshold: f32) -> u32 {
-    var sum = 0u;
-    for (var i = 0u; i < 8; i++) {
-        sum += (1u << i) * u32(cube[i] < surface_threshold);
-    }
-
-    return sum;
-}
-
-fn calculate_triangles(
-    id: vec3<u32>,
-    normalize_vector: vec3<f32>,
-    cube_vertices: array<vec3<f32>, 8>,
-    sample_counts: vec3<u32>,
-) -> array<f32, 45> {
-    let cube_bottom_left = vec3f(f32(id.x), f32(id.y), f32(id.z)) * normalize_vector + parameters.domain_bl;
-
-    var cube_samples = array<f32, 8>();
-
-    for (var i = 0; i < 8; i++) {
-        cube_samples[i] = samples[index_samples(id + vec3u(cube_vertices[i]), sample_counts)];
-    }
-
-    let surface_threshold = 0.00001;
-
-    let cube_index = calculate_cube_index(cube_samples, surface_threshold);
-
-    let vertices_of_edges = array(
-        vec2u(0, 1),
-        vec2u(1, 2),
-        vec2u(2, 3),
-        vec2u(0, 3),
-        vec2u(4, 5),
-        vec2u(5, 6),
-        vec2u(6, 7),
-        vec2u(4, 7),
-        vec2u(0, 4),
-        vec2u(1, 5),
-        vec2u(2, 6),
-        vec2u(3, 7),
-    );
-
-    var position_offsets = array<vec3<f32>, 8>();
-
-    for (var i = 0; i < 8; i++) {
-        position_offsets[i] = cube_vertices[i] * normalize_vector;
-    }
-
-    var points = array<vec3<f32>, 12>();
-    for (var edge = 0; edge < 12; edge++) {
-        let edge_pos = array(
-            cube_bottom_left + position_offsets[vertices_of_edges[edge].x],
-            cube_bottom_left + position_offsets[vertices_of_edges[edge].y],
-        );
-
-        let edge_sdf = vec2f(cube_samples[vertices_of_edges[edge].x], cube_samples[vertices_of_edges[edge].y]);
-        points[edge] = edge_pos[0] - edge_sdf.x * (edge_pos[1] - edge_pos[0]) / (edge_sdf.y - edge_sdf.x);
-    }
-
-    var triangles = array<f32, 45>();
-
-    for (var i = 0; i < 15; i++) {
-        let vert_idx = TRIANGLE_TABLE[cube_index][i];
-        let is_valid = f32(vert_idx != -1);
-        let point = is_valid * points[vert_idx] + (1.0 - is_valid) * vec3f(0x7f800000); // Infinity if the vertex is not valid
-        triangles[3 * i] = point.x;
-        triangles[3 * i + 1] = point.y;
-        triangles[3 * i + 2] = point.z;
-    }
-
-    return triangles;
-}
-
-@compute
-@workgroup_size(1)
-fn main(@builtin(workgroup_id) id: vec3<u32>, @builtin(num_workgroups) sample_counts: vec3<u32>) {
-    let domain_diff = parameters.domain_tr - parameters.domain_bl;
-    let normalize_vector = domain_diff
-        / vec3f(f32(sample_counts.x - 1), f32(sample_counts.y - 1), f32(sample_counts.z - 1));
-
-    let cube_vertices = array(
-        vec3f(0.0, 0.0, 0.0),
-        vec3f(1.0, 0.0, 0.0),
-        vec3f(1.0, 1.0, 0.0),
-        vec3f(0.0, 1.0, 0.0),
-        vec3f(0.0, 0.0, 1.0),
-        vec3f(1.0, 0.0, 1.0),
-        vec3f(1.0, 1.0, 1.0),
-        vec3f(0.0, 1.0, 1.0),
-    );
-
-    triangles[index_samples(id, sample_counts)] = calculate_triangles(id, normalize_vector, cube_vertices, sample_counts);
-}

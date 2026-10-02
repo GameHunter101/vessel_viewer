@@ -93,11 +93,11 @@ impl MarchingCubesComponent {
 
         let mesh_compute = &mut computes[1];
 
-        mesh_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(x, y, z));
+        mesh_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(x - 1, y - 1, z - 1));
         mesh_compute
             .update_buffer_attachment(
                 2,
-                bytemuck::cast_slice(&vec![0.0_f32; (x * y * z) as usize * 15]),
+                bytemuck::cast_slice(&vec![0.0_f32; ((x - 1) * (y - 1) * (z - 1)) as usize * 45]),
                 device,
                 queue,
             )
@@ -113,8 +113,6 @@ impl MarchingCubesComponent {
         let vector_max = |a: Vector3<f32>, b: Vector3<f32>| {
             Vector3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
         };
-        // nearby_edges.iter().last().map(|x| *x as f32).unwrap_or(f32::INFINITY)
-        // edge_map.temp(point)
 
         nearby_edges
             .into_iter()
@@ -498,6 +496,8 @@ impl<'a> MarchingCubes<'a> {
                                             })
                                             .collect();
 
+                                        println!("({x}, {y}, {z}) | {cube_index}");
+
                                         triangles
                                     })
                                     .collect::<Vec<_>>()
@@ -505,13 +505,13 @@ impl<'a> MarchingCubes<'a> {
                             .collect::<Vec<_>>()
                     })
                 })
-                .flat_map(|handle| handle.join().unwrap())
+                .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
 
-        for row in tris {
-            println!("{row:?}");
-        }
+        /* for row in tris {
+            println!("{}", row.len());
+        } */
 
         /* let normals = tris
             .iter()

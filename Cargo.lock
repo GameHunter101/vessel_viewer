@@ -3123,8 +3123,8 @@ dependencies = [
 
 [[package]]
 name = "v4"
-version = "0.3.22"
-source = "git+https://github.com/GameHunter101/V4-Engine#29d6ff015a9951b42af1fb6423cfa2eec2ae7142"
+version = "0.3.23"
+source = "git+https://github.com/GameHunter101/V4-Engine#04eae2b3bfdc20d3007ba9a08d139ce6e0d5e864"
 dependencies = [
  "algoe",
  "async-trait",
@@ -3144,8 +3144,8 @@ dependencies = [
 
 [[package]]
 name = "v4-core"
-version = "0.3.25"
-source = "git+https://github.com/GameHunter101/V4-Engine#29d6ff015a9951b42af1fb6423cfa2eec2ae7142"
+version = "0.3.28"
+source = "git+https://github.com/GameHunter101/V4-Engine#04eae2b3bfdc20d3007ba9a08d139ce6e0d5e864"
 dependencies = [
  "algoe",
  "async-scoped",
@@ -3176,7 +3176,7 @@ dependencies = [
 [[package]]
 name = "v4-macros"
 version = "0.3.22"
-source = "git+https://github.com/GameHunter101/V4-Engine#29d6ff015a9951b42af1fb6423cfa2eec2ae7142"
+source = "git+https://github.com/GameHunter101/V4-Engine#04eae2b3bfdc20d3007ba9a08d139ce6e0d5e864"
 dependencies = [
  "darling",
  "proc-macro2",

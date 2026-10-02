@@ -21,6 +21,11 @@ struct VesselEdge {
     p1: vec2<f32>,
 }
 
+fn INF() -> f32 {
+    let temp = bitcast<f32>(0x7f800000u);
+    return temp;
+}
+
 fn cell_to_index(cell: vec3<u32>) -> u32 {
     return parameters.cell_counts.x * parameters.cell_counts.y * cell.z + parameters.cell_counts.x * cell.y + cell.x;
 }
@@ -32,7 +37,7 @@ fn vector_project(line: vec3<f32>, point: vec3<f32>) -> vec3<f32> {
 fn sdf_point(pos: vec3<f32>) -> f32 {
     let grid_pos = vec3u(pos / parameters.cell_size);
 
-    var sample: f32 = 0x7f800000; // Hex representation of infinity
+    var sample: f32 = INF();
     for (var x = -1; x <= 1; x++) {
         for (var y = -1; y <= 1; y++) {
             for (var z = -1; z <= 1; z++) {
