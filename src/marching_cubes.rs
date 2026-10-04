@@ -2,6 +2,10 @@ use std::io::Write;
 
 use nalgebra::Vector3;
 use rand::rngs::StdRng;
+use rayon::{
+    iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    slice::ParallelSlice,
+};
 use v4::{
     builtin_actions::RegisterUiComponentAction,
     component,
@@ -93,7 +97,11 @@ impl MarchingCubesComponent {
 
         let mesh_compute = &mut computes[1];
 
-        mesh_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(x - 1, y - 1, z - 1));
+        mesh_compute.set_workgroup_counts(v4::ecs::compute::WorkgroupCounts::Static(
+            x - 1,
+            y - 1,
+            z - 1,
+        ));
         mesh_compute
             .update_buffer_attachment(
                 2,
@@ -133,6 +141,62 @@ impl MarchingCubesComponent {
             .unwrap_or(f32::INFINITY)
     }
 
+    fn write_obj(data: Vec<f32>) {
+        let points: Vec<Vector3<f32>> = data
+            .par_chunks_exact(3)
+            .flat_map(|chunk| {
+                if chunk[0] == f32::INFINITY {
+                    None
+                } else {
+                    Some(Vector3::new(chunk[0], chunk[1], chunk[2]))
+                }
+            })
+            .collect();
+
+        let tris: Vec<[Vector3<f32>; 3]> = points
+            .par_chunks_exact(3)
+            .map(|tri| {
+                let tri: [Vector3<f32>; 3] = tri.try_into().unwrap();
+                tri
+            })
+            .collect();
+
+        let normals = tris
+            .par_iter()
+            .map(|tri| (tri[1] - tri[0]).cross(&(tri[2] - tri[0])).normalize())
+            .collect::<Vec<_>>();
+
+        let mut obj = std::fs::File::create("./vessels.obj").unwrap();
+
+        let verts_str: String = tris
+            .par_iter()
+            .flatten()
+            .map(|vert| format!("v {} {} {}\n", vert.x, vert.y, vert.z))
+            .collect();
+        obj.write_all(&verts_str.into_bytes()).unwrap();
+        let normals_str: String = normals
+            .par_iter()
+            .flat_map(|normal| {
+                (0..3)
+                    .into_par_iter()
+                    .map(|_| format!("vn {} {} {}\n", normal.x, normal.y, normal.z))
+            })
+            .collect();
+        obj.write_all(&normals_str.into_bytes()).unwrap();
+
+        let faces_str: String = (0..tris.len())
+            .map(|face_idx| {
+                format!(
+                    "f {} {} {}\n",
+                    3 * face_idx + 1,
+                    3 * face_idx + 2,
+                    3 * face_idx + 3
+                )
+            })
+            .collect();
+        obj.write_all(&faces_str.into_bytes()).unwrap();
+    }
+
     fn generate_mesh(
         &self,
         computes: &mut [Compute],
@@ -166,7 +230,7 @@ impl MarchingCubesComponent {
                 timestamp_writes: None,
             });
 
-            for compute in computes_to_execute {
+            for compute in &computes_to_execute {
                 Compute::individual_compute_execution(
                     compute,
                     device,
@@ -177,34 +241,45 @@ impl MarchingCubesComponent {
             }
         }
 
+        let v4::ecs::material::ShaderAttachment::Buffer(triangles_buf) =
+            &computes_to_execute[1].attachments()[2]
+        else {
+            return;
+        };
+
+        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Triangle staging buffer"),
+            size: triangles_buf.buffer().size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(
+            &triangles_buf.buffer(),
+            0,
+            &staging_buf,
+            0,
+            triangles_buf.buffer().size(),
+        );
+
+        let (tx, rx) = flume::bounded(1);
+        encoder.map_buffer_on_submit(&staging_buf, wgpu::MapMode::Read, .., move |r| {
+            tx.send(r).unwrap()
+        });
+
         queue.submit(Some(encoder.finish()));
 
-        /* let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) =
-            &move |point: Vector3<f32>| Self::vessel_sdf(edge_map, point, parameters.vessel_thickness);
-        // let tik = std::time::Instant::now();
-        let marching_cubes = MarchingCubes::new(
-            [
-                Vector3::new(-1.0, -1.0, -1.0) * (parameters.vessel_thickness + parameters.domain_padding),
-                Vector3::new(
-                    AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
-                    AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
-                    parameters.vessel_thickness + parameters.domain_padding,
-                ),
-            ],
-            &sdf,
-            300,
-            300,
-            12,
-        );
-        println!("{:?}", marching_cubes.samples);
-        let tok = std::time::Instant::now();
-        marching_cubes.march_cubes(0.00001);
-        println!(
-            "Total: {}, grid gen: {}, polygonization: {}",
-            tik.elapsed().as_secs(),
-            (tok - tik).as_secs(),
-            tok.elapsed().as_secs()
-        ) */
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        rx.recv().unwrap().unwrap();
+
+        {
+            let view = staging_buf.get_mapped_range(..);
+            let data: Vec<f32> = bytemuck::allocation::pod_collect_to_vec(&view);
+            Self::write_obj(data);
+        }
+
+        staging_buf.unmap();
     }
 }
 
@@ -248,47 +323,21 @@ impl ComponentSystem for MarchingCubesComponent {
         let parameters = MarchingCubesData {
             cell_size: network_component.edge_map().cell_size(),
             cell_counts: network_component.edge_map().cell_counts().map(|v| v as u32),
+            vessel_thickness: 1.5,
             ..Default::default()
         };
 
-        self.generate_mesh(
-            computes,
-            &raw_edge_map,
-            &raw_edges,
-            parameters,
-            device,
-            queue,
-        );
-
         if self.execute_compute_step {
-            let sdf: &(dyn Fn(Vector3<f32>) -> f32 + Sync) = &move |point: Vector3<f32>| {
-                Self::vessel_sdf(
-                    network_component.edge_map(),
-                    point,
-                    parameters.vessel_thickness,
-                )
-            };
-            // let tik = std::time::Instant::now();
-            let marching_cubes = MarchingCubes::new(
-                [
-                    Vector3::new(-1.0, -1.0, -1.0)
-                        * (parameters.vessel_thickness + parameters.domain_padding),
-                    Vector3::new(
-                        AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
-                        AREA_SIZE as f32 + parameters.vessel_thickness + parameters.domain_padding,
-                        parameters.vessel_thickness + parameters.domain_padding,
-                    ),
-                ],
-                &sdf,
-                self.marching_cubes_samples.0 as usize,
-                self.marching_cubes_samples.1 as usize,
-                self.marching_cubes_samples.2 as usize,
-                /* 300,
-                300,
-                12, */
+            let start_time = std::time::Instant::now();
+            self.generate_mesh(
+                computes,
+                &raw_edge_map,
+                &raw_edges,
+                parameters,
+                device,
+                queue,
             );
-            marching_cubes.march_cubes(0.00001);
-            // println!("{:?}", marching_cubes.samples);
+            println!("Mesh generation: {}", start_time.elapsed().as_millis());
             self.execute_compute_step = false;
         }
 
@@ -505,44 +554,10 @@ impl<'a> MarchingCubes<'a> {
                 })
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
-        }).into_iter().flatten().collect();
-
-        /* for row in tris {
-            println!("{}", row.len());
-        } */
-
-        let normals = tris
-            .iter()
-            .map(|tri| (tri[1] - tri[0]).cross(&(tri[2] - tri[0])).normalize())
-            .collect::<Vec<_>>();
-
-        let mut obj = std::fs::File::create("./vessels.obj").unwrap();
-
-        let verts_str: String = tris
-            .iter()
-            .flatten()
-            .map(|vert| format!("v {} {} {}\n", vert.x, vert.y, vert.z))
-            .collect();
-        obj.write_all(&verts_str.into_bytes()).unwrap();
-        let normals_str: String = normals
-            .iter()
-            .flat_map(|normal| {
-                (0..3).map(|_| format!("vn {} {} {}\n", normal.x, normal.y, normal.z))
-            })
-            .collect();
-        obj.write_all(&normals_str.into_bytes()).unwrap();
-
-        let faces_str: String = (0..tris.len())
-            .map(|face_idx| {
-                format!(
-                    "f {} {} {}\n",
-                    3 * face_idx + 1,
-                    3 * face_idx + 2,
-                    3 * face_idx + 3
-                )
-            })
-            .collect();
-        obj.write_all(&faces_str.into_bytes()).unwrap();
+        })
+        .into_iter()
+        .flatten()
+        .collect();
     }
 }
 

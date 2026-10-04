@@ -38,6 +38,10 @@ async fn main() {
             wgpu::Features::POLYGON_MODE_LINE
                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
         )
+        .limits(wgpu::Limits {
+            max_storage_buffer_binding_size: 0x3FFF_FFFC,
+            ..Default::default()
+        })
         .window_attributes(WindowAttributes::default().with_surface_size(
             winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(800, 800)),
         ))
@@ -262,7 +266,7 @@ async fn main() {
                                 device,
                                 bytemuck::cast_slice(&[0.0_f32; 45]),
                                 wgpu::BufferBindingType::Storage { read_only: false },
-                                wgpu::BufferUsages::COPY_DST
+                                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
                             ),
                             visibility: wgpu::ShaderStages::COMPUTE,
                         }
