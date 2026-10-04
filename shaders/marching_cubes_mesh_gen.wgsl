@@ -83,22 +83,16 @@ fn calculate_triangles(
 
     var triangles = array<f32, 45>();
 
-    var count = 0;
     for (var i = 0; i < 15; i++) {
         let vert_idx = TRIANGLE_TABLE[cube_index][i];
-        let is_valid = f32(vert_idx != -1);
-        let point = is_valid * points[vert_idx] + (1.0 - is_valid) * vec3f(0x7f800000); // Infinity if the vertex is not valid
+        var point = points[vert_idx];
+        if (vert_idx == -1) {
+            point = vec3f(INF()); // Infinity if the vertex is not valid
+        }
         triangles[3 * i] = point.x;
         triangles[3 * i + 1] = point.y;
         triangles[3 * i + 2] = point.z;
     }
-
-    /* var triangles = array<f32, 45>();
-
-    triangles[0] = f32(id.x);
-    triangles[1] = f32(id.y);
-    triangles[2] = f32(id.z);
-    triangles[3] = f32(cube_index); */
 
     return triangles;
 }

@@ -441,7 +441,7 @@ impl<'a> MarchingCubes<'a> {
         let samples = &self.samples;
         let domain = self.domain;
 
-        let tris = std::thread::scope(|scope| {
+        let tris: Vec<[Vector3<f32>; 3]> = std::thread::scope(|scope| {
             (0..z_samples - 1)
                 .map(|z| {
                     scope.spawn(move || {
@@ -496,8 +496,6 @@ impl<'a> MarchingCubes<'a> {
                                             })
                                             .collect();
 
-                                        println!("({x}, {y}, {z}) | {cube_index}");
-
                                         triangles
                                     })
                                     .collect::<Vec<_>>()
@@ -507,13 +505,13 @@ impl<'a> MarchingCubes<'a> {
                 })
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
-        });
+        }).into_iter().flatten().collect();
 
         /* for row in tris {
             println!("{}", row.len());
         } */
 
-        /* let normals = tris
+        let normals = tris
             .iter()
             .map(|tri| (tri[1] - tri[0]).cross(&(tri[2] - tri[0])).normalize())
             .collect::<Vec<_>>();
@@ -544,7 +542,7 @@ impl<'a> MarchingCubes<'a> {
                 )
             })
             .collect();
-        obj.write_all(&faces_str.into_bytes()).unwrap(); */
+        obj.write_all(&faces_str.into_bytes()).unwrap();
     }
 }
 
